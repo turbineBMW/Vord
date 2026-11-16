@@ -1,6 +1,7 @@
 //! The few Bitwarden server endpoints a read-only client needs, as
 //! Vaultwarden serves them: prelogin (the account's KDF), the password and
-//! refresh-token grants, sync, and website icons.
+//! refresh-token grants (with a second step when the account asks for one),
+//! sync, and website icons.
 //!
 //! Calls block; the UI runs them on a worker thread.
 //!
@@ -28,8 +29,8 @@ pub enum ApiError {
     Network(String),
     /// The server refused the login, with its own message.
     Rejected(String),
-    /// The account wants a second step Vord can't do.
-    TwoFactor,
+    /// The account wants a second login step, one of these.
+    TwoFactor(TwoFactorChallenge),
     /// The session is over: the refresh token was revoked or expired.
     SessionExpired,
     Other(String),
@@ -40,9 +41,7 @@ impl std::fmt::Display for ApiError {
         match self {
             Self::Network(why) => write!(f, "Could not reach the server: {why}"),
             Self::Rejected(why) => f.write_str(why),
-            Self::TwoFactor => {
-                f.write_str("This account uses two-step login, which Vord does not support yet.")
-            }
+            Self::TwoFactor(_) => f.write_str("This account needs a second login step."),
             Self::SessionExpired => f.write_str("The session has expired. Log in again."),
             Self::Other(why) => f.write_str(why),
         }
@@ -50,6 +49,126 @@ impl std::fmt::Display for ApiError {
 }
 
 impl std::error::Error for ApiError {}
+
+/// The second login steps Vord can answer, in Bitwarden's
+/// `TwoFactorProviderType` numbering. Each one is a code the user types (a
+/// YubiKey in OTP mode types its own).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TwoFactorMethod {
+    YubiKey,
+    Authenticator,
+    Email,
+}
+
+impl TwoFactorMethod {
+    /// Most preferred first, the order Bitwarden's apps pick a default in.
+    pub const ALL: [Self; 3] = [Self::YubiKey, Self::Authenticator, Self::Email];
+
+    pub fn id(self) -> u8 {
+        match self {
+            Self::Authenticator => 0,
+            Self::Email => 1,
+            Self::YubiKey => 3,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Authenticator => "Authenticator app",
+            Self::Email => "Email",
+            Self::YubiKey => "YubiKey",
+        }
+    }
+
+    /// The word the CLI takes for it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Authenticator => "authenticator",
+            Self::Email => "email",
+            Self::YubiKey => "yubikey",
+        }
+    }
+}
+
+/// The remembered-device token, sent in place of a code.
+const REMEMBER: u8 = 5;
+
+/// What the server asks for when a login needs a second step.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TwoFactorChallenge {
+    /// The steps Vord can answer, most preferred first.
+    pub methods: Vec<TwoFactorMethod>,
+    /// The ones it can't (Duo, FIDO2 security keys), by name.
+    pub unsupported: Vec<&'static str>,
+    /// The masked address an email code goes to.
+    pub email_hint: Option<String>,
+    /// How many steps the server offered. With email the only one, the
+    /// server has already sent the code.
+    pub offered: usize,
+}
+
+impl TwoFactorChallenge {
+    /// Read from a refused login, if that's why it was refused.
+    fn from_body(body: &Value) -> Option<Self> {
+        let detailed = body.get("twoFactorProviders2").and_then(Value::as_object);
+        let listed = body.get("twoFactorProviders").and_then(Value::as_array);
+        if detailed.is_none() && listed.is_none() {
+            return None;
+        }
+        // The detailed map's keys are the ids; the plain list holds numbers
+        // or strings, depending on the server.
+        let ids: Vec<u8> = match detailed {
+            Some(map) => map.keys().filter_map(|k| k.parse().ok()).collect(),
+            None => listed
+                .into_iter()
+                .flatten()
+                .filter_map(|v| match v {
+                    Value::Number(n) => n.as_u64().and_then(|n| u8::try_from(n).ok()),
+                    Value::String(s) => s.parse().ok(),
+                    _ => None,
+                })
+                .collect(),
+        };
+        let methods = TwoFactorMethod::ALL
+            .into_iter()
+            .filter(|m| ids.contains(&m.id()))
+            .collect();
+        let mut unsupported = Vec::new();
+        for id in &ids {
+            let name = match id {
+                2 | 6 => "Duo",
+                4 | 7 => "a security key (FIDO2)",
+                _ => continue,
+            };
+            if !unsupported.contains(&name) {
+                unsupported.push(name);
+            }
+        }
+        let email_hint = body
+            .pointer("/twoFactorProviders2/1/email")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        Some(Self {
+            methods,
+            unsupported,
+            email_hint,
+            offered: ids.len(),
+        })
+    }
+}
+
+/// The second step sent with a login.
+pub enum SecondFactor<'a> {
+    /// A code for one of the account's methods; `remember` asks the server
+    /// for a token that skips the step on this device next time.
+    Code {
+        method: TwoFactorMethod,
+        code: &'a str,
+        remember: bool,
+    },
+    /// The token a remembered device got.
+    Remembered(&'a str),
+}
 
 /// Lower-case the first letter of every object key, recursively.
 pub fn camel(value: Value) -> Value {
@@ -133,6 +252,8 @@ pub struct Tokens {
     pub key: Option<String>,
     /// The account's RSA private key, encrypted with the user key.
     pub private_key: Option<String>,
+    /// A new remembered-device token, when one was asked for.
+    pub two_factor_token: Option<String>,
 }
 
 impl Client {
@@ -208,24 +329,41 @@ impl Client {
         .map_err(|e| ApiError::Other(e.to_string()))
     }
 
-    /// Log in with the master password hash.
+    /// Log in with the master password hash, and a second step when the
+    /// account wants one. Without the right one the answer is
+    /// [`ApiError::TwoFactor`], saying which steps the account has.
     pub fn login(
         &self,
         email: &str,
         password_hash: &str,
         device_id: &str,
+        second: Option<SecondFactor<'_>>,
     ) -> Result<Tokens, ApiError> {
         let device_name = format!("Vord on {}", hostname());
-        let form = [
-            ("grant_type", "password"),
-            ("username", email.trim()),
-            ("password", password_hash),
-            ("scope", "api offline_access"),
-            ("client_id", CLIENT_ID),
-            ("deviceType", DEVICE_TYPE),
-            ("deviceIdentifier", device_id),
-            ("deviceName", device_name.as_str()),
+        let mut form = vec![
+            ("grant_type", "password".to_string()),
+            ("username", email.trim().to_string()),
+            ("password", password_hash.to_string()),
+            ("scope", "api offline_access".to_string()),
+            ("client_id", CLIENT_ID.to_string()),
+            ("deviceType", DEVICE_TYPE.to_string()),
+            ("deviceIdentifier", device_id.to_string()),
+            ("deviceName", device_name),
         ];
+        let (provider, token, remember) = match second {
+            Some(SecondFactor::Code {
+                method,
+                code,
+                remember,
+            }) => (Some(method.id()), Some(code), remember),
+            Some(SecondFactor::Remembered(token)) => (Some(REMEMBER), Some(token), false),
+            None => (None, None, false),
+        };
+        if let (Some(provider), Some(token)) = (provider, token) {
+            form.push(("twoFactorProvider", provider.to_string()));
+            form.push(("twoFactorToken", token.to_string()));
+            form.push(("twoFactorRemember", u8::from(remember).to_string()));
+        }
         let response = self
             .http
             .post(self.url("/identity/connect/token"))
@@ -241,14 +379,39 @@ impl Client {
             .map_err(network)?;
         let (status, body) = Self::read(response)?;
         if !status.is_success() {
-            if body.get("twoFactorProviders").is_some() || body.get("twoFactorProviders2").is_some()
-            {
-                return Err(ApiError::TwoFactor);
+            if let Some(challenge) = TwoFactorChallenge::from_body(&body) {
+                return Err(ApiError::TwoFactor(challenge));
             }
             return Err(error_from(status, &body));
         }
         serde_json::from_value(body)
             .map_err(|e| ApiError::Network(format!("unexpected login answer: {e}")))
+    }
+
+    /// Ask the server to email a login code. The master password hash
+    /// proves the request comes from someone who has the password.
+    pub fn send_email_code(
+        &self,
+        email: &str,
+        password_hash: &str,
+        device_id: &str,
+    ) -> Result<(), ApiError> {
+        let response = self
+            .http
+            .post(self.url("/api/two-factor/send-email-login"))
+            .json(&serde_json::json!({
+                "email": email.trim(),
+                "masterPasswordHash": password_hash,
+                "deviceIdentifier": device_id,
+            }))
+            .send()
+            .map_err(network)?;
+        let (status, body) = Self::read(response)?;
+        if status.is_success() {
+            Ok(())
+        } else {
+            Err(error_from(status, &body))
+        }
     }
 
     /// Trade the refresh token for a new access token.
@@ -376,6 +539,34 @@ mod tests {
         assert!(normalize_server("http://vault.example.com").is_err());
         assert!(normalize_server("").is_err());
         assert!(normalize_server("ftp://x").is_err());
+    }
+
+    #[test]
+    fn two_factor_challenges() {
+        // Vaultwarden: ids as strings, details per id, PascalCase.
+        let body = camel(serde_json::json!({
+            "error": "invalid_grant",
+            "error_description": "Two factor required.",
+            "TwoFactorProviders": ["0", "1", "7"],
+            "TwoFactorProviders2": { "0": null, "1": { "Email": "t***@vord.test" }, "7": {} }
+        }));
+        let challenge = TwoFactorChallenge::from_body(&body).unwrap();
+        assert_eq!(
+            challenge.methods,
+            [TwoFactorMethod::Authenticator, TwoFactorMethod::Email]
+        );
+        assert_eq!(challenge.unsupported, ["a security key (FIDO2)"]);
+        assert_eq!(challenge.email_hint.as_deref(), Some("t***@vord.test"));
+        assert_eq!(challenge.offered, 3);
+
+        // A bare list of numbers; Duo twice is named once.
+        let body = serde_json::json!({ "twoFactorProviders": [2, 6, 3] });
+        let challenge = TwoFactorChallenge::from_body(&body).unwrap();
+        assert_eq!(challenge.methods, [TwoFactorMethod::YubiKey]);
+        assert_eq!(challenge.unsupported, ["Duo"]);
+
+        let wrong_password = serde_json::json!({ "error": "invalid_grant" });
+        assert_eq!(TwoFactorChallenge::from_body(&wrong_password), None);
     }
 
     #[test]

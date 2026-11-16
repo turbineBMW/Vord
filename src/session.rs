@@ -1,12 +1,13 @@
 //! Logging in, unlocking and syncing, without any UI. Every function here
 //! blocks (key derivation, network) and runs on a worker thread.
 
-use crate::api::{ApiError, Client};
-use crate::crypto::{CryptoError, EncString, MasterKey, SymmetricKey};
+use crate::api::{ApiError, Client, SecondFactor, TwoFactorMethod};
+use crate::crypto::{CryptoError, EncString, Kdf, MasterKey, SymmetricKey};
 use crate::store::{self, Account};
 use crate::vault::{Keys, Vault};
 use serde_json::Value;
 use std::time::{SystemTime, UNIX_EPOCH};
+use zeroize::Zeroizing;
 
 fn now() -> u64 {
     SystemTime::now()
@@ -75,17 +76,165 @@ pub fn open_cached(account: &Account, user_key: SymmetricKey) -> (Keys, Option<V
     (keys, vault)
 }
 
-/// Log in for the first time: prelogin, derive, authenticate. Saves the
-/// account and returns it with the opened user key.
-pub fn login(server: &str, email: &str, password: &str) -> Result<(Account, SymmetricKey), Error> {
+/// How a login went: done, or waiting for its second step.
+pub enum Login {
+    Done(Account, SymmetricKey),
+    SecondStep(PendingLogin),
+}
+
+/// A login that has passed the password and waits for a second step. It
+/// holds what the retry needs, so the password isn't derived again; the
+/// master key and its hash are zeroed when it's dropped.
+pub struct PendingLogin {
+    server: String,
+    email: String,
+    kdf: Kdf,
+    master: MasterKey,
+    password_hash: Zeroizing<String>,
+    device_id: String,
+    /// The steps the account offers that Vord can answer, most preferred
+    /// first. Never empty.
+    pub methods: Vec<TwoFactorMethod>,
+    /// The masked address email codes go to.
+    pub email_hint: Option<String>,
+    /// Whether the server emailed a code on its own (it does when email is
+    /// the account's only second step).
+    pub email_sent: bool,
+}
+
+impl std::fmt::Debug for PendingLogin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingLogin")
+            .field("server", &self.server)
+            .field("email", &self.email)
+            .field("methods", &self.methods)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PendingLogin {
+    pub fn email(&self) -> &str {
+        &self.email
+    }
+
+    pub fn server(&self) -> &str {
+        &self.server
+    }
+}
+
+/// Log in for the first time: prelogin, derive, authenticate, with a
+/// remembered device's token if this account has one. Saves the account
+/// once the server lets it in.
+pub fn login(server: &str, email: &str, password: &str) -> Result<Login, Error> {
     let client = Client::new(server);
     let kdf = client.prelogin(email)?;
     let master = MasterKey::derive(password, email, kdf)?;
-    let device_id = Account::load()
-        .filter(|a| a.server == server)
-        .map(|a| a.device_id)
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let tokens = client.login(email, &master.password_hash(password), &device_id)?;
+    let password_hash = Zeroizing::new(master.password_hash(password));
+    let device_id = store::device_id();
+    let remembered = store::remembered_two_factor(server, email);
+    let second = remembered.as_deref().map(SecondFactor::Remembered);
+    match client.login(email, &password_hash, &device_id, second) {
+        Ok(tokens) => {
+            let (account, user_key) = finish(server, email, kdf, &master, device_id, tokens)?;
+            Ok(Login::Done(account, user_key))
+        }
+        Err(ApiError::TwoFactor(challenge)) => {
+            if remembered.is_some() {
+                log::info!("the remembered-device token was refused; asking for a code");
+                store::set_remembered_two_factor(server, email, None);
+            }
+            if challenge.methods.is_empty() {
+                let names = if challenge.unsupported.is_empty() {
+                    "a method".to_string()
+                } else {
+                    challenge.unsupported.join(" or ")
+                };
+                return Err(Error::Other(format!(
+                    "This account's two-step login uses {names}, which Vord can't do yet. \
+                     Add an authenticator app or email as a second method in the web vault to log in here."
+                )));
+            }
+            let email_sent =
+                challenge.offered == 1 && challenge.methods == [TwoFactorMethod::Email];
+            Ok(Login::SecondStep(PendingLogin {
+                server: server.to_string(),
+                email: email.trim().to_string(),
+                kdf,
+                master,
+                password_hash,
+                device_id,
+                methods: challenge.methods,
+                email_hint: challenge.email_hint,
+                email_sent,
+            }))
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Finish a login with a code. On a wrong code the pending login stays
+/// good for another try.
+pub fn second_step(
+    pending: &PendingLogin,
+    method: TwoFactorMethod,
+    code: &str,
+    remember: bool,
+) -> Result<(Account, SymmetricKey), Error> {
+    let code: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+    if code.is_empty() {
+        return Err(Error::Other("Enter the code.".into()));
+    }
+    let client = Client::new(&pending.server);
+    let second = SecondFactor::Code {
+        method,
+        code: &code,
+        remember,
+    };
+    let tokens = client
+        .login(
+            &pending.email,
+            &pending.password_hash,
+            &pending.device_id,
+            Some(second),
+        )
+        .map_err(|error| match error {
+            // Vaultwarden's words carry the server time and the caller's IP;
+            // they go to the log. Some servers answer by asking again.
+            ApiError::Rejected(_) | ApiError::TwoFactor(_) => {
+                log::warn!("the server refused the code: {error}");
+                Error::Other("That code wasn't accepted. Check it and try again.".into())
+            }
+            other => other.into(),
+        })?;
+    finish(
+        &pending.server,
+        &pending.email,
+        pending.kdf,
+        &pending.master,
+        pending.device_id.clone(),
+        tokens,
+    )
+}
+
+/// Ask the server to email a login code.
+pub fn send_email_code(pending: &PendingLogin) -> Result<(), Error> {
+    Client::new(&pending.server).send_email_code(
+        &pending.email,
+        &pending.password_hash,
+        &pending.device_id,
+    )?;
+    Ok(())
+}
+
+/// The server let us in: open the user key, save the account.
+fn finish(
+    server: &str,
+    email: &str,
+    kdf: Kdf,
+    master: &MasterKey,
+    device_id: String,
+    tokens: crate::api::Tokens,
+) -> Result<(Account, SymmetricKey), Error> {
     let user_key_text = tokens.key.ok_or_else(|| {
         Error::Other(
             "The server sent no vault key. Accounts that sign in with SSO or Key Connector are not supported."
@@ -93,6 +242,9 @@ pub fn login(server: &str, email: &str, password: &str) -> Result<(Account, Symm
         )
     })?;
     let user_key = master.open_user_key(&user_key_text.parse()?)?;
+    if let Some(token) = tokens.two_factor_token {
+        store::set_remembered_two_factor(server, email, Some(token));
+    }
     let account = Account {
         server: server.to_string(),
         email: email.trim().to_string(),

@@ -25,7 +25,7 @@ fn main() -> anyhow::Result<()> {
         Some("login") => cli_login(&args[2..]),
         Some("list") => cli_list(),
         Some("--help" | "-h" | "help") => {
-            println!("Vord {}: a Bitwarden / Vaultwarden vault for the desktop.\n\n  vord                     open the app\n  vord login SERVER EMAIL  log in (master password on stdin)\n  vord list                unlock, sync and list items (master password on stdin)", env!("CARGO_PKG_VERSION"));
+            println!("Vord {}: a Bitwarden / Vaultwarden vault for the desktop.\n\n  vord                     open the app\n  vord login SERVER EMAIL [--method authenticator|email|yubikey] [--remember]\n                           log in (master password, then any code, on stdin)\n  vord list                unlock, sync and list items (master password on stdin)", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
         _ => {
@@ -88,23 +88,78 @@ fn run_app() {
     app.run_with_args::<&str>(&[]);
 }
 
-/// The master password, from the first line of stdin.
-fn read_password() -> anyhow::Result<String> {
-    eprint!("Master password: ");
+/// One line of stdin, after a prompt on stderr.
+fn read_line(prompt: &str) -> anyhow::Result<String> {
+    eprint!("{prompt}: ");
     let mut line = String::new();
     std::io::stdin().lock().read_line(&mut line)?;
     Ok(line.trim_end_matches(['\r', '\n']).to_string())
 }
 
-/// `vord login SERVER EMAIL`, master password on stdin.
+/// The master password, from the first line of stdin.
+fn read_password() -> anyhow::Result<String> {
+    read_line("Master password")
+}
+
+/// `vord login SERVER EMAIL [--method NAME] [--remember]`: the master
+/// password on stdin, then a code if the account wants a second step.
 fn cli_login(args: &[String]) -> anyhow::Result<()> {
-    let [server, email] = args else {
-        anyhow::bail!("usage: vord login SERVER EMAIL  (master password on stdin)");
+    const USAGE: &str =
+        "usage: vord login SERVER EMAIL [--method authenticator|email|yubikey] [--remember]";
+    let mut positional = Vec::new();
+    let mut method = None;
+    let mut remember = false;
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--remember" => remember = true,
+            "--method" => {
+                let name = args.next().ok_or_else(|| anyhow::anyhow!(USAGE))?;
+                method = Some(
+                    api::TwoFactorMethod::ALL
+                        .into_iter()
+                        .find(|m| m.name() == name)
+                        .ok_or_else(|| anyhow::anyhow!("unknown method {name}\n{USAGE}"))?,
+                );
+            }
+            _ => positional.push(arg),
+        }
+    }
+    let [server, email] = positional[..] else {
+        anyhow::bail!(USAGE);
     };
     let server = api::normalize_server(server).map_err(anyhow::Error::msg)?;
     let password = read_password()?;
-    let (account, _) =
-        session::login(&server, email, &password).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let error = |e: session::Error| anyhow::anyhow!("{e}");
+    let account = match session::login(&server, email, &password).map_err(error)? {
+        session::Login::Done(account, _) => account,
+        session::Login::SecondStep(pending) => {
+            let method = method.unwrap_or(pending.methods[0]);
+            if !pending.methods.contains(&method) {
+                let offered: Vec<_> = pending.methods.iter().map(|m| m.name()).collect();
+                anyhow::bail!(
+                    "this account has no {} step; it offers {}",
+                    method.name(),
+                    offered.join(", ")
+                );
+            }
+            if method == api::TwoFactorMethod::Email && !pending.email_sent {
+                session::send_email_code(&pending).map_err(error)?;
+            }
+            let prompt = match method {
+                api::TwoFactorMethod::Authenticator => "Code from the authenticator app".into(),
+                api::TwoFactorMethod::Email => format!(
+                    "Code sent to {}",
+                    pending.email_hint.as_deref().unwrap_or("your email")
+                ),
+                api::TwoFactorMethod::YubiKey => "Touch the YubiKey".into(),
+            };
+            let code = read_line(&prompt)?;
+            session::second_step(&pending, method, &code, remember)
+                .map_err(error)?
+                .0
+        }
+    };
     println!("logged in as {} on {}", account.email, account.server);
     Ok(())
 }

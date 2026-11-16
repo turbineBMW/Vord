@@ -28,6 +28,8 @@ Omarchy theme live.
 - Works offline: unlocking needs no network. The vault syncs on unlock, every
   10 minutes and with Ctrl+R.
 - Organization items, including per-item keys.
+- Two-step login with an authenticator app, an emailed code or a YubiKey
+  (OTP), and "remember this device".
 
 Vord is read-only for now. Edit items in the web vault or another Bitwarden
 app, and Vord picks the change up on its next sync.
@@ -35,8 +37,9 @@ app, and Vord picks the change up on its next sync.
 ### Not yet
 
 - Creating or editing items, and a password generator.
-- Two-step login (authenticator, email or security key). Accounts that use it
-  get a clear error at login.
+- Two-step login with Duo or a FIDO2 security key. An account that has only
+  those gets a clear error at login; one that also has an authenticator app or
+  email can use those.
 - Downloading attachments. Their names are shown.
 - SSO and Key Connector accounts.
 
@@ -68,6 +71,10 @@ Vord follows the Bitwarden client protocol and does all decryption locally:
   as the server sent it, still encrypted. This is what the official desktop
   app keeps too, and it is why unlocking works offline. Nothing decrypted is
   ever written.
+- `device.json` there holds this device's id and, if you ticked "Remember
+  this device", the server's token for skipping two-step login. Like the
+  official apps, Vord keeps it when you log out; delete the file to forget
+  the device.
 - Keys are zeroed when the vault locks, and every widget that showed
   decrypted text is destroyed.
 
