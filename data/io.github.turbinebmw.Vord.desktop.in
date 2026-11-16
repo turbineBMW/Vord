@@ -1,0 +1,12 @@
+[Desktop Entry]
+Name=Vord
+GenericName=Password Manager
+Comment=Your Bitwarden and Vaultwarden vault
+Exec=vord
+Icon=io.github.turbinebmw.Vord
+Terminal=false
+Type=Application
+Categories=GTK;Utility;Security;
+Keywords=Bitwarden;Vaultwarden;Password;Vault;Login;TOTP;2FA;
+StartupNotify=true
+StartupWMClass=io.github.turbinebmw.Vord

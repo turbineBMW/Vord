@@ -1,0 +1,138 @@
+/* Vord's own look, on top of libadwaita and the Omarchy palette. Colours come
+   from libadwaita's variables so a theme reaches all of them. */
+
+/* Vault sidebar: a count at the end of a row, as in Rustle's folder list. */
+.vault-count {
+  font-size: 0.9em;
+  font-feature-settings: "tnum";
+}
+
+/* A section heading among the sidebar rows. */
+.vault-heading {
+  font-size: 0.8em;
+  font-weight: bold;
+  color: var(--dim-label-color, alpha(currentColor, 0.55));
+  margin: 14px 12px 4px 12px;
+}
+
+/* The item list: rows run edge to edge with a hairline between them, as
+   Rustle's message list does. */
+.item-list > row {
+  border-radius: 0;
+  margin-left: 0;
+  margin-right: 0;
+}
+
+.item-list > row:not(:last-child):not(:selected) {
+  box-shadow: inset 0 -1px var(--border-color);
+}
+
+.item-row {
+  padding: 9px 12px;
+}
+
+.item-name {
+  font-weight: 500;
+}
+
+.item-subtitle {
+  font-size: 0.9em;
+}
+
+/* An item's icon: the website's own, or the item type's glyph on a soft
+   accent tile. */
+.item-icon {
+  border-radius: 8px;
+  min-width: 32px;
+  min-height: 32px;
+}
+
+.item-icon.glyph,
+.detail-icon.glyph {
+  background-color: color-mix(in srgb, var(--accent-bg-color) 18%, transparent);
+  color: var(--accent-color);
+}
+
+.item-icon.favicon,
+.detail-icon.favicon {
+  background-color: color-mix(in srgb, var(--view-fg-color) 6%, transparent);
+}
+
+.detail-icon {
+  border-radius: 14px;
+  min-width: 64px;
+  min-height: 64px;
+}
+
+.favorite-star,
+button.favorite {
+  color: var(--accent-color);
+}
+
+/* The search field under the list's header, as Rustle's "Search mail". */
+.list-search {
+  margin: 0 8px 8px 8px;
+}
+
+/* Details: the item's name in its own block above its fields, like
+   Rustle's reader header. */
+.detail-header {
+  padding: 24px 24px 18px 24px;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.detail-title {
+  font-size: 1.6em;
+  font-weight: bold;
+}
+
+.detail-meta {
+  font-size: 0.9em;
+}
+
+.detail-meta .accent {
+  color: var(--accent-color);
+}
+
+/* Secrets and codes read character by character. */
+row.monospace-value .subtitle,
+.totp-code {
+  font-family: monospace;
+}
+
+.totp-code {
+  font-size: 1.35em;
+  font-weight: bold;
+  letter-spacing: 0.06em;
+  color: var(--accent-color);
+}
+
+/* The seconds a code has left. */
+.totp-timer {
+  font-size: 0.85em;
+  font-feature-settings: "tnum";
+  min-width: 26px;
+}
+
+.totp-timer.expiring {
+  color: var(--warning-color);
+}
+
+.notes-card {
+  padding: 12px 14px;
+}
+
+.damaged-banner {
+  color: var(--warning-color);
+}
+
+/* Login and unlock. */
+.vord-brand {
+  font-size: 2.2em;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+}
+
+.form-error {
+  color: var(--error-color);
+}

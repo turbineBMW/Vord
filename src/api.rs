@@ -1,0 +1,393 @@
+//! The few Bitwarden server endpoints a read-only client needs, as
+//! Vaultwarden serves them: prelogin (the account's KDF), the password and
+//! refresh-token grants, sync, and website icons.
+//!
+//! Calls block; the UI runs them on a worker thread.
+//!
+//! Servers disagree on JSON key case (Vaultwarden and older Bitwarden answer
+//! `PascalCase`, newer ones `camelCase`), so every response goes through
+//! [`camel`] before it is read.
+
+use crate::crypto::Kdf;
+use serde::Deserialize;
+use serde_json::Value;
+use std::time::Duration;
+
+/// Linux desktop, in Bitwarden's DeviceType enum.
+const DEVICE_TYPE: &str = "8";
+const CLIENT_ID: &str = "desktop";
+/// Servers hide item types from clients too old to know them (Vaultwarden
+/// leaves SSH keys out of a sync for clients before 2024.12), so Vord states
+/// the desktop release whose item types it reads.
+const CLIENT_VERSION: &str = "2025.6.0";
+
+#[derive(Debug)]
+pub enum ApiError {
+    /// The server could not be reached, or answered with something that
+    /// isn't Bitwarden.
+    Network(String),
+    /// The server refused the login, with its own message.
+    Rejected(String),
+    /// The account wants a second step Vord can't do.
+    TwoFactor,
+    /// The session is over: the refresh token was revoked or expired.
+    SessionExpired,
+    Other(String),
+}
+
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Network(why) => write!(f, "Could not reach the server: {why}"),
+            Self::Rejected(why) => f.write_str(why),
+            Self::TwoFactor => {
+                f.write_str("This account uses two-step login, which Vord does not support yet.")
+            }
+            Self::SessionExpired => f.write_str("The session has expired. Log in again."),
+            Self::Other(why) => f.write_str(why),
+        }
+    }
+}
+
+impl std::error::Error for ApiError {}
+
+/// Lower-case the first letter of every object key, recursively.
+pub fn camel(value: Value) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .map(|(key, value)| {
+                    let mut chars = key.chars();
+                    let key = match chars.next() {
+                        Some(first) => first.to_lowercase().chain(chars).collect(),
+                        None => key,
+                    };
+                    (key, camel(value))
+                })
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.into_iter().map(camel).collect()),
+        other => other,
+    }
+}
+
+/// Make what the user typed into a base URL: a scheme, no trailing slash.
+pub fn normalize_server(input: &str) -> Result<String, String> {
+    let input = input.trim().trim_end_matches('/');
+    if input.is_empty() {
+        return Err("Enter your server's address.".into());
+    }
+    let with_scheme = if input.contains("://") {
+        input.to_string()
+    } else {
+        format!("https://{input}")
+    };
+    let url = url::Url::parse(&with_scheme).map_err(|e| format!("Not a web address: {e}"))?;
+    match url.scheme() {
+        "https" => {}
+        // Plain HTTP only on this machine (a local test server).
+        "http" if is_loopback(&url) => {}
+        "http" => return Err("The server address must use https://.".into()),
+        other => return Err(format!("Unsupported address scheme {other}://.")),
+    }
+    if url.host_str().is_none() {
+        return Err("The address has no host name.".into());
+    }
+    Ok(url.as_str().trim_end_matches('/').to_string())
+}
+
+fn is_loopback(url: &url::Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(host)) => host == "localhost",
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    }
+}
+
+pub struct Client {
+    http: reqwest::blocking::Client,
+    pub server: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Prelogin {
+    kdf: u8,
+    kdf_iterations: u32,
+    kdf_memory: Option<u32>,
+    kdf_parallelism: Option<u32>,
+}
+
+/// What a successful login or refresh hands back.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Tokens {
+    #[serde(rename = "access_token")]
+    pub access_token: String,
+    #[serde(rename = "expires_in", default)]
+    pub expires_in: u64,
+    #[serde(rename = "refresh_token")]
+    pub refresh_token: Option<String>,
+    /// The user key, encrypted with the stretched master key (login only).
+    pub key: Option<String>,
+    /// The account's RSA private key, encrypted with the user key.
+    pub private_key: Option<String>,
+}
+
+impl Client {
+    pub fn new(server: &str) -> Self {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("Bitwarden-Client-Name", CLIENT_ID.parse().expect("ASCII"));
+        headers.insert(
+            "Bitwarden-Client-Version",
+            CLIENT_VERSION.parse().expect("ASCII"),
+        );
+        headers.insert("Device-Type", DEVICE_TYPE.parse().expect("ASCII"));
+        let http = reqwest::blocking::Client::builder()
+            .user_agent(concat!("Vord/", env!("CARGO_PKG_VERSION")))
+            .default_headers(headers)
+            .timeout(Duration::from_secs(30))
+            .connect_timeout(Duration::from_secs(10))
+            .build()
+            .expect("HTTP client");
+        Self {
+            http,
+            server: server.to_string(),
+        }
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!("{}{path}", self.server)
+    }
+
+    fn read(
+        response: reqwest::blocking::Response,
+    ) -> Result<(reqwest::StatusCode, Value), ApiError> {
+        let status = response.status();
+        let text = response
+            .text()
+            .map_err(|e| ApiError::Network(e.to_string()))?;
+        let value = if text.trim().is_empty() {
+            Value::Null
+        } else {
+            match serde_json::from_str(&text) {
+                Ok(value) => camel(value),
+                Err(_) if status.is_success() => {
+                    return Err(ApiError::Network(
+                        "the answer was not JSON — is this a Bitwarden or Vaultwarden server?"
+                            .into(),
+                    ))
+                }
+                Err(_) => Value::Null,
+            }
+        };
+        Ok((status, value))
+    }
+
+    /// The account's KDF settings, needed before the password can be hashed.
+    pub fn prelogin(&self, email: &str) -> Result<Kdf, ApiError> {
+        let response = self
+            .http
+            .post(self.url("/identity/accounts/prelogin"))
+            .json(&serde_json::json!({ "email": email.trim() }))
+            .send()
+            .map_err(network)?;
+        let (status, body) = Self::read(response)?;
+        if !status.is_success() {
+            return Err(error_from(status, &body));
+        }
+        let prelogin: Prelogin = serde_json::from_value(body)
+            .map_err(|e| ApiError::Network(format!("unexpected prelogin answer: {e}")))?;
+        Kdf::from_prelogin(
+            prelogin.kdf,
+            prelogin.kdf_iterations,
+            prelogin.kdf_memory,
+            prelogin.kdf_parallelism,
+        )
+        .map_err(|e| ApiError::Other(e.to_string()))
+    }
+
+    /// Log in with the master password hash.
+    pub fn login(
+        &self,
+        email: &str,
+        password_hash: &str,
+        device_id: &str,
+    ) -> Result<Tokens, ApiError> {
+        let device_name = format!("Vord on {}", hostname());
+        let form = [
+            ("grant_type", "password"),
+            ("username", email.trim()),
+            ("password", password_hash),
+            ("scope", "api offline_access"),
+            ("client_id", CLIENT_ID),
+            ("deviceType", DEVICE_TYPE),
+            ("deviceIdentifier", device_id),
+            ("deviceName", device_name.as_str()),
+        ];
+        let response = self
+            .http
+            .post(self.url("/identity/connect/token"))
+            .header(
+                "Auth-Email",
+                base64::Engine::encode(
+                    &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                    email.trim(),
+                ),
+            )
+            .form(&form)
+            .send()
+            .map_err(network)?;
+        let (status, body) = Self::read(response)?;
+        if !status.is_success() {
+            if body.get("twoFactorProviders").is_some() || body.get("twoFactorProviders2").is_some()
+            {
+                return Err(ApiError::TwoFactor);
+            }
+            return Err(error_from(status, &body));
+        }
+        serde_json::from_value(body)
+            .map_err(|e| ApiError::Network(format!("unexpected login answer: {e}")))
+    }
+
+    /// Trade the refresh token for a new access token.
+    pub fn refresh(&self, refresh_token: &str) -> Result<Tokens, ApiError> {
+        let form = [
+            ("grant_type", "refresh_token"),
+            ("client_id", CLIENT_ID),
+            ("refresh_token", refresh_token),
+        ];
+        let response = self
+            .http
+            .post(self.url("/identity/connect/token"))
+            .form(&form)
+            .send()
+            .map_err(network)?;
+        let (status, body) = Self::read(response)?;
+        match status.as_u16() {
+            200..=299 => serde_json::from_value(body)
+                .map_err(|e| ApiError::Network(format!("unexpected refresh answer: {e}"))),
+            400 | 401 => Err(ApiError::SessionExpired),
+            _ => Err(error_from(status, &body)),
+        }
+    }
+
+    /// The whole vault, still encrypted, keys in camelCase.
+    pub fn sync(&self, access_token: &str) -> Result<Value, ApiError> {
+        let response = self
+            .http
+            .get(self.url("/api/sync?excludeDomains=true"))
+            .bearer_auth(access_token)
+            .send()
+            .map_err(network)?;
+        let (status, body) = Self::read(response)?;
+        match status.as_u16() {
+            200..=299 => Ok(body),
+            401 => Err(ApiError::SessionExpired),
+            _ => Err(error_from(status, &body)),
+        }
+    }
+
+    /// A website's icon from the server's icon service. `None` when it has
+    /// none.
+    pub fn icon(&self, host: &str) -> Option<Vec<u8>> {
+        let response = self
+            .http
+            .get(self.url(&format!("/icons/{host}/icon.png")))
+            .timeout(Duration::from_secs(10))
+            .send()
+            .ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        let bytes = response.bytes().ok()?;
+        (!bytes.is_empty() && bytes.len() < 512 * 1024).then(|| bytes.to_vec())
+    }
+}
+
+fn network(error: reqwest::Error) -> ApiError {
+    let mut message = error.to_string();
+    let mut source = std::error::Error::source(&error);
+    while let Some(inner) = source {
+        message = format!("{message}: {inner}");
+        source = inner.source();
+    }
+    ApiError::Network(message)
+}
+
+/// The server's own words for a failure, wherever it put them.
+fn error_from(status: reqwest::StatusCode, body: &Value) -> ApiError {
+    let message = body
+        .pointer("/errorModel/message")
+        .or_else(|| body.get("message"))
+        .or_else(|| body.get("error_description"))
+        .or_else(|| body.get("error"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    match (status.as_u16(), message) {
+        (400 | 401, Some(message)) => ApiError::Rejected(message),
+        (_, Some(message)) => ApiError::Other(format!("{message} ({status})")),
+        (404, None) => {
+            ApiError::Network("the server has no Bitwarden API at this address (404)".into())
+        }
+        (_, None) => ApiError::Other(format!("The server answered {status}.")),
+    }
+}
+
+fn hostname() -> String {
+    std::fs::read_to_string("/etc/hostname")
+        .ok()
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "Linux".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn camel_cases_keys_deeply() {
+        let value = camel(serde_json::json!({
+            "Profile": { "Key": "k", "Organizations": [{ "Id": 1 }] },
+            "access_token": "x",
+            "": 0
+        }));
+        assert_eq!(value["profile"]["key"], "k");
+        assert_eq!(value["profile"]["organizations"][0]["id"], 1);
+        assert_eq!(value["access_token"], "x");
+    }
+
+    #[test]
+    fn server_addresses() {
+        assert_eq!(
+            normalize_server(" vault.example.com/ ").unwrap(),
+            "https://vault.example.com"
+        );
+        assert_eq!(
+            normalize_server("https://example.com/vw/").unwrap(),
+            "https://example.com/vw"
+        );
+        assert_eq!(
+            normalize_server("http://localhost:8222").unwrap(),
+            "http://localhost:8222"
+        );
+        assert!(normalize_server("http://vault.example.com").is_err());
+        assert!(normalize_server("").is_err());
+        assert!(normalize_server("ftp://x").is_err());
+    }
+
+    #[test]
+    fn server_errors_are_read_in_any_case() {
+        let body = camel(serde_json::json!({
+            "error": "invalid_grant",
+            "ErrorModel": { "Message": "Username or password is incorrect. Try again" }
+        }));
+        let error = error_from(reqwest::StatusCode::BAD_REQUEST, &body);
+        assert_eq!(
+            error.to_string(),
+            "Username or password is incorrect. Try again"
+        );
+    }
+}

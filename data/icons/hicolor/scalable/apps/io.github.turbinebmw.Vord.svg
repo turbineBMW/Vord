@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="rim" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#7b8794"/>
+      <stop offset="1" stop-color="#4a5562"/>
+    </linearGradient>
+    <linearGradient id="face" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3f6f8f"/>
+      <stop offset="1" stop-color="#2b4f69"/>
+    </linearGradient>
+    <linearGradient id="brass" gradientUnits="userSpaceOnUse" x1="0" y1="140" x2="0" y2="380">
+      <stop offset="0" stop-color="#f3c86a"/>
+      <stop offset="1" stop-color="#d49a2f"/>
+    </linearGradient>
+    <clipPath id="right">
+      <rect x="256" y="0" width="256" height="512"/>
+    </clipPath>
+  </defs>
+  <!-- shadow -->
+  <path d="M256 44 L436 104 C436 300 376 412 256 476 C136 412 76 300 76 104 Z" fill="#000" opacity="0.18" transform="translate(0 10)"/>
+  <!-- rim -->
+  <path d="M256 36 L440 98 C440 300 380 414 256 480 C132 414 72 300 72 98 Z" fill="url(#rim)"/>
+  <!-- face -->
+  <path d="M256 70 L408 121 C406 293 356 390 256 445 C156 390 106 293 104 121 Z" fill="url(#face)"/>
+  <!-- the right half a shade darker, as the siblings' facets -->
+  <path d="M256 70 L408 121 C406 293 356 390 256 445 Z" fill="#000" opacity="0.14"/>
+  <path d="M256 36 L440 98 C440 300 380 414 256 480 Z" fill="none"/>
+  <g clip-path="url(#right)">
+    <path d="M256 36 L440 98 C440 300 380 414 256 480 L256 445 C356 390 406 293 408 121 L256 70 Z" fill="#000" opacity="0.12"/>
+  </g>
+  <!-- Algiz, the rune of protection -->
+  <g stroke="url(#brass)" stroke-width="34" stroke-linecap="round" stroke-linejoin="round" fill="none">
+    <path d="M256 150 L256 372"/>
+    <path d="M256 250 L178 162"/>
+    <path d="M256 250 L334 162"/>
+  </g>
+  <!-- highlight on the rim's top edge -->
+  <path d="M256 36 L440 98 L436 112 L256 52 L76 112 L72 98 Z" fill="#fff" opacity="0.22"/>
+</svg>

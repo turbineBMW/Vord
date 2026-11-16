@@ -1,0 +1,44 @@
+[package]
+name = "vord"
+version = "0.1.0"
+edition = "2021"
+description = "A Bitwarden / Vaultwarden vault for the Linux desktop: GTK 4 and libadwaita, following the Omarchy theme"
+license = "GPL-3.0-or-later"
+
+[dependencies]
+gtk = { package = "gtk4", version = "0.11", features = ["v4_18"] }
+adw = { package = "libadwaita", version = "0.9", features = ["v1_8"] }
+log = "0.4"
+env_logger = "0.11"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "blocking", "json", "form"] }
+url = "2"
+directories = "6"
+uuid = { version = "1", features = ["v4"] }
+base64 = "0.22"
+data-encoding = "2"
+zeroize = { version = "1", features = ["derive"] }
+# The RustCrypto line that shares digest 0.10.
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
+hmac = "0.12"
+sha1 = "0.10"
+sha2 = "0.10"
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+hkdf = "0.12"
+argon2 = "0.5"
+rsa = { version = "0.9", features = ["sha1", "sha2"] }
+subtle = "2"
+rand = "0.8"
+
+[dev-dependencies]
+tempfile = "3"
+
+# Argon2 and PBKDF2 with 600 000 rounds are slow unoptimised.
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
