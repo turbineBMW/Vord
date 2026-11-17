@@ -41,7 +41,7 @@ pub fn start(ui: &Rc<Ui>) {
     let stop: Arc<AtomicBool> = Default::default();
     let started = agent::serve(stop.clone(), |request| {
         glib::idle_add_once(move || {
-            if let Some(ui) = super::LIVE_UI.with(|w| w.borrow().upgrade()) {
+            if let Some(ui) = super::THE_UI.with(|w| w.borrow().upgrade()) {
                 on_request(&ui, request);
             }
         });

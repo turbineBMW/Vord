@@ -48,6 +48,9 @@ Omarchy theme live.
   expiry, a view limit and a password; hide your email or deactivate one.
   The link is copied when a Send is made; everything in it, file included,
   is encrypted before it leaves, and the key travels only in the link.
+- A tray icon (Preferences → Tray), for Waybar, Omarchy's shell and any
+  other StatusNotifierItem host: click to show or hide Vord, or lock and
+  quit from its menu. Closing the window can leave Vord running there.
 - An SSH agent for the vault's SSH keys (Ed25519, RSA, ECDSA), off until
   you turn it on in Preferences: point `SSH_AUTH_SOCK` at its socket and
   `ssh` and `git` use them. Vord asks before a key signs (every time, once
@@ -78,7 +81,7 @@ The aim is to do what the Bitwarden desktop app does, in this order:
 5. ~~Sends: sharing text and files by link.~~ Done.
 6. ~~Exporting the vault, unlocking with a PIN, syncing the moment
    something changes on the server, an SSH agent for the vault's SSH
-   keys.~~ Done. More than one account, and a tray icon.
+   keys, a tray icon.~~ Done. More than one account.
 7. Two-step login with Duo or a FIDO2 security key, logging in by approving
    from another device, and SSO.
 

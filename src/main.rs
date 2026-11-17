@@ -16,6 +16,7 @@ mod settings;
 mod sidebar;
 mod store;
 mod totp;
+mod tray;
 mod ui;
 mod vault;
 

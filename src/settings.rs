@@ -27,6 +27,10 @@ pub struct Settings {
     /// When the agent asks before a key is used: 0 every time, 1 once per
     /// key until the vault locks, 2 never.
     pub ssh_agent_ask: u32,
+    /// Show an icon in the tray.
+    pub tray: bool,
+    /// With the tray icon, closing the window keeps Vord running.
+    pub close_to_tray: bool,
 }
 
 impl Default for Settings {
@@ -42,6 +46,8 @@ impl Default for Settings {
             generator: crate::generator::Options::default(),
             ssh_agent: false,
             ssh_agent_ask: 0,
+            tray: false,
+            close_to_tray: true,
         }
     }
 }
