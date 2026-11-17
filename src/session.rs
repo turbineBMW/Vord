@@ -753,6 +753,44 @@ pub fn change(mut account: Account, change: Change) -> Result<(Account, Value, T
     Ok((account, sync, touched))
 }
 
+/// Check the master password again, as Bitwarden's apps do before an
+/// export. Works offline.
+pub fn check_master_password(account: &Account, password: &str) -> Result<(), Error> {
+    unlock_key(account, password).map(|_| ())
+}
+
+/// Export the cached vault to `path`, readable only by the user. The one
+/// place besides a saved attachment where Vord writes decrypted data, and
+/// only where the user chose. `file_password` is for
+/// [`crate::export::Format::PasswordJson`].
+pub fn export(
+    account: &Account,
+    user_key: &SymmetricKey,
+    format: crate::export::Format,
+    file_password: &str,
+    path: &std::path::Path,
+) -> Result<(), Error> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let sync = store::load_vault()
+        .ok_or_else(|| Error::Other("There's no synced vault to export yet.".into()))?;
+    let data = crate::export::build(&sync, user_key, format, file_password, account.kdf)
+        .map_err(|why| Error::Other(format!("Could not export the vault: {why}")))?;
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .and_then(|mut file| {
+            // A file that was there keeps its old mode: tighten it first.
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            file.write_all(data.as_bytes())?;
+            file.sync_all()
+        });
+    written.map_err(|e| Error::Other(format!("Could not write the file: {e}")))
+}
+
 /// Open a fresh sync with the user key in hand.
 pub fn open_sync(account: &Account, user_key: SymmetricKey, sync: &Value) -> Unlocked {
     let keys = Keys::new(user_key, sync, account.private_key.as_deref());

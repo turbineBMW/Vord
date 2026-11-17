@@ -3,6 +3,7 @@ mod api;
 mod clipboard;
 mod crypto;
 mod edit;
+mod export;
 mod generator;
 mod icons;
 mod omarchy;
@@ -28,8 +29,9 @@ fn main() -> anyhow::Result<()> {
         Some("login") => cli_login(&args[2..]),
         Some("list") => cli_list(),
         Some("generate") => cli_generate(&args[2..]),
+        Some("export") => cli_export(&args[2..]),
         Some("--help" | "-h" | "help") => {
-            println!("Vord {}: a Bitwarden / Vaultwarden vault for the desktop.\n\n  vord                     open the app\n  vord login SERVER EMAIL [--method authenticator|email|yubikey] [--remember]\n                           log in (master password, then any code, on stdin)\n  vord list                unlock, sync and list items (master password on stdin)\n  vord generate [password|passphrase|username]\n                           make one with the generator's saved options", env!("CARGO_PKG_VERSION"));
+            println!("Vord {}: a Bitwarden / Vaultwarden vault for the desktop.\n\n  vord                     open the app\n  vord login SERVER EMAIL [--method authenticator|email|yubikey] [--remember]\n                           log in (master password, then any code, on stdin)\n  vord list                unlock, sync and list items (master password on stdin)\n  vord generate [password|passphrase|username]\n                           make one with the generator's saved options\n  vord export json|csv|encrypted_json|password_json FILE\n                           unlock, sync and export (master password, then any\n                           file password, on stdin)", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
         _ => {
@@ -191,6 +193,44 @@ fn cli_generate(args: &[String]) -> anyhow::Result<()> {
         }
     };
     println!("{value}");
+    Ok(())
+}
+
+/// `vord export FORMAT FILE`: unlock, sync, and export as the app does.
+fn cli_export(args: &[String]) -> anyhow::Result<()> {
+    const USAGE: &str = "usage: vord export json|csv|encrypted_json|password_json FILE";
+    let [format, path] = args else {
+        anyhow::bail!(USAGE);
+    };
+    let format = match format.as_str() {
+        "json" => export::Format::Json,
+        "csv" => export::Format::Csv,
+        "encrypted_json" => export::Format::AccountJson,
+        "password_json" => export::Format::PasswordJson,
+        other => anyhow::bail!("unknown format {other}\n{USAGE}"),
+    };
+    let account = store::Account::load().ok_or_else(|| anyhow::anyhow!("not logged in"))?;
+    let password = zeroize::Zeroizing::new(read_password()?);
+    let file_password = zeroize::Zeroizing::new(if format == export::Format::PasswordJson {
+        let typed = read_line("File password")?;
+        if typed.is_empty() {
+            anyhow::bail!("the file password can't be empty");
+        }
+        typed
+    } else {
+        String::new()
+    });
+    let user_key = session::unlock_key(&account, &password).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let (account, _) = session::sync(account).map_err(|e| anyhow::anyhow!("{e}"))?;
+    session::export(
+        &account,
+        &user_key,
+        format,
+        &file_password,
+        std::path::Path::new(path),
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    eprintln!("exported to {path}");
     Ok(())
 }
 

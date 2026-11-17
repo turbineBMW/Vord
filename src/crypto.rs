@@ -105,7 +105,12 @@ pub struct MasterKey([u8; 32]);
 
 impl MasterKey {
     pub fn derive(password: &str, email: &str, kdf: Kdf) -> Result<Self, CryptoError> {
-        let salt = normalize_email(email);
+        Self::derive_with_salt(password, &normalize_email(email), kdf)
+    }
+
+    /// As [`MasterKey::derive`], with a salt taken as it is: a
+    /// password-protected export salts with random text.
+    pub fn derive_with_salt(password: &str, salt: &str, kdf: Kdf) -> Result<Self, CryptoError> {
         let mut out = [0u8; 32];
         match kdf {
             Kdf::Pbkdf2 { iterations } => {

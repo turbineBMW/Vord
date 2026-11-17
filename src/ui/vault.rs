@@ -144,6 +144,7 @@ impl VaultView {
         let section = gtk::gio::Menu::new();
         section.append(Some("_Generator"), Some("win.generator"));
         section.append(Some("New _Folder…"), Some("win.new-folder"));
+        section.append(Some("_Export Vault…"), Some("win.export"));
         section.append(Some("_Sync Now"), Some("win.sync"));
         section.append(Some("_Lock"), Some("win.lock"));
         menu.append_section(None, &section);
