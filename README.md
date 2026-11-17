@@ -25,8 +25,9 @@ Omarchy theme live.
 - Locks after 15 minutes in the background (configurable), when the screen
   locks (logind and Omarchy's lock screen), before sleep, and with Ctrl+L.
 - Honours Bitwarden's "master password re-prompt" on protected items.
-- Works offline: unlocking needs no network. The vault syncs on unlock, every
-  10 minutes and with Ctrl+R.
+- Works offline: unlocking needs no network. The vault syncs on unlock, the
+  moment the server says it changed elsewhere (its notifications hub, as
+  Bitwarden's apps use), every 10 minutes and with Ctrl+R.
 - Organization items, including per-item keys.
 - A generator for passwords, passphrases and usernames (random word,
   plus-addressed or catch-all email), with Bitwarden's options. What you copy
@@ -70,9 +71,9 @@ The aim is to do what the Bitwarden desktop app does, in this order:
    and between its collections.~~ Done.
 4. ~~Attachments: downloading and uploading them.~~ Done.
 5. ~~Sends: sharing text and files by link.~~ Done.
-6. ~~Exporting the vault, unlocking with a PIN.~~ Done. Syncing the moment
-   something changes on the server, an SSH agent for the vault's SSH keys,
-   more than one account, and a tray icon.
+6. ~~Exporting the vault, unlocking with a PIN, syncing the moment
+   something changes on the server.~~ Done. An SSH agent for the vault's SSH
+   keys, more than one account, and a tray icon.
 7. Two-step login with Duo or a FIDO2 security key, logging in by approving
    from another device, and SSO.
 

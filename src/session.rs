@@ -356,6 +356,18 @@ fn authed<T>(
     Ok(result?)
 }
 
+/// A usable access token for the notifications hub, refreshed if it's
+/// about to expire. Returns the account, whose tokens may be new.
+pub fn hub_token(mut account: Account) -> Result<(Account, String), Error> {
+    let client = Client::new(&account.server);
+    let before = account.access_token.clone();
+    let token = access_token(&client, &mut account, false)?;
+    if account.access_token != before {
+        account.save();
+    }
+    Ok((account, token))
+}
+
 /// Fetch the vault, still encrypted, and keep it. Returns the updated
 /// account (new tokens, a changed user key) for the caller to hold.
 pub fn sync(mut account: Account) -> Result<(Account, Value), Error> {

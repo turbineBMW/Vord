@@ -6,6 +6,7 @@ mod edit;
 mod export;
 mod generator;
 mod icons;
+mod live;
 mod omarchy;
 mod screenlock;
 mod send;
