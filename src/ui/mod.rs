@@ -608,6 +608,7 @@ impl Ui {
         dialog.set_close_response("cancel");
         // Checked before the dialog closes, so a wrong password can be retyped.
         dialog.set_response_enabled("ok", true);
+        let focus = entry.clone();
         let ui = self.clone();
         let item_id = item_id.to_string();
         let then = Rc::new(then);
@@ -638,6 +639,8 @@ impl Ui {
             });
         });
         dialog.present(Some(&self.window));
+        // Typing goes to the password, not to the Continue button.
+        dialog.set_focus(Some(&focus));
     }
 
     pub fn reprompt_cleared_for(&self, item_id: &str) -> bool {
@@ -772,10 +775,10 @@ impl Ui {
             return;
         };
         let draft = editor.draft();
-        if let Some(problem) = draft.problem() {
+        if let Some(problem) = draft.problem(editor.original.as_ref()) {
             return self.toast(problem);
         }
-        let body = {
+        let change = {
             let session = self.session.borrow();
             let Some(keys) = session.as_ref().map(|s| &s.keys) else {
                 return;
@@ -798,21 +801,54 @@ impl Ui {
                             return self.toast("This item can't be saved: its key won't open.");
                         }
                     };
+                    // The body is made as for the item's current owner; a
+                    // move then encrypts it for the organization.
+                    let mut saved = draft.clone();
+                    saved.org_id.clone_from(&original.org_id);
                     let base = edit::Base { raw, original };
-                    edit::request(&draft, Some(base), &key, &saver)
+                    let mut body = edit::request(&saved, Some(base), &key, &saver);
+                    match (&original.org_id, &draft.org_id) {
+                        (None, Some(org_id)) => {
+                            let Some(org) = keys.orgs.get(org_id) else {
+                                return self.toast("Vord has no key for that organization.");
+                            };
+                            if let Err(why) =
+                                edit::into_organization(&mut body, raw, &keys.user, org_id, org)
+                            {
+                                return self.toast(&why);
+                            }
+                            session::Change::Share {
+                                id: id.clone(),
+                                body,
+                                collections: draft.collection_ids.clone(),
+                            }
+                        }
+                        _ => {
+                            let mut before = original.collection_ids.clone();
+                            let mut after = draft.collection_ids.clone();
+                            before.sort();
+                            after.sort();
+                            session::Change::SaveItem {
+                                id: Some(id.clone()),
+                                body,
+                                collections: draft.collection_ids.clone(),
+                                move_collections: before != after,
+                            }
+                        }
+                    }
                 }
                 _ => {
                     let Some(key) = keys.for_org(draft.org_id.as_deref()) else {
                         return self.toast("Vord has no key for that organization.");
                     };
-                    edit::request(&draft, None, key, &saver)
+                    session::Change::SaveItem {
+                        id: None,
+                        body: edit::request(&draft, None, key, &saver),
+                        collections: draft.collection_ids.clone(),
+                        move_collections: false,
+                    }
                 }
             }
-        };
-        let change = session::Change::SaveItem {
-            id: editor.id.clone(),
-            body,
-            collections: draft.collection_ids.clone(),
         };
         self.vault.set_saving(true);
         let message = if editor.id.is_some() {

@@ -36,7 +36,8 @@ src/store.rs     account.json + vault.json (still encrypted) in $XDG_DATA_HOME/v
                  generation counter keeps a sync from overwriting a change made meanwhile
 src/vault.rs     the decrypted model; one bad item is marked `damaged`, never fatal;
                  `Vault::raw` keeps each item as the server sent it
-src/edit.rs      Draft (an item as an editor holds it) and `request`, the body that saves it
+src/edit.rs      Draft (an item as an editor holds it), `request` (the body that saves it),
+                 `into_organization` (re-seal the item key, or re-encrypt it all, to share)
 src/generator.rs passwords / passphrases / usernames, Bitwarden's rules; EFF list in data/
 src/totp.rs      otpauth://, steam://, bare base32; RFC 6238 vectors in the tests
 src/clipboard.rs secret copies carry x-kde-passwordManagerHint=secret; auto-clear
@@ -114,7 +115,8 @@ cargo run -- login http://localhost:8222 test@vord.test [--method email] [--reme
 ```
 
 Writes against the seeded server: `cargo test -- --ignored live_changes` (folders,
-favorite, trash, restore, purge, refusing a stale copy). Vaultwarden only refuses a
+favorite, trash, restore, purge, refusing a stale copy, moving into the organization
+and between its collections; it adds a collection each run). Vaultwarden only refuses a
 stale copy when the item changed more than a second after it.
 
 Bitwarden's own web vault comes with Vaultwarden and is the check that what Vord
