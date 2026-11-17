@@ -122,6 +122,7 @@ impl VaultView {
         sidebar_header.pack_start(&header_toggle(&root));
         let menu = gtk::gio::Menu::new();
         let section = gtk::gio::Menu::new();
+        section.append(Some("_Generator"), Some("win.generator"));
         section.append(Some("_Sync Now"), Some("win.sync"));
         section.append(Some("_Lock"), Some("win.lock"));
         menu.append_section(None, &section);

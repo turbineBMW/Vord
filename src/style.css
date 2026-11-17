@@ -136,3 +136,16 @@ row.monospace-value .subtitle,
 .form-error {
   color: var(--error-color);
 }
+
+/* The generator's value: large enough to read character by character. */
+.generated-card {
+  padding: 12px 8px 12px 16px;
+}
+
+.generated-value {
+  font-size: 1.2em;
+}
+
+.generated-history label.title {
+  font-family: monospace;
+}

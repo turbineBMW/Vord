@@ -1,8 +1,8 @@
 // Fill a throwaway local Vaultwarden with a test vault, encrypted the way
 // Bitwarden clients do it, with Node's crypto (independent of Vord's Rust).
 //
-//   docker run -d --name vord-test-vw -e SIGNUPS_ALLOWED=true \
-//     -p 127.0.0.1:8222:80 vaultwarden/server:latest
+//   docker run -d --name vord-test-vw -e I_REALLY_WANT_VOLATILE_STORAGE=true \
+//     -e SIGNUPS_ALLOWED=true -p 127.0.0.1:8222:80 vaultwarden/server:latest
 //   node tests/seed.js [http://localhost:8222]
 //
 // Then: VORD_DATA_DIR=/tmp/vord-test cargo run -- login http://localhost:8222 test@vord.test

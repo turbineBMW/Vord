@@ -12,6 +12,7 @@
 //! the vault was locked again is dropped (see [`Ui::epoch`]).
 
 mod detail;
+mod generator;
 mod pages;
 mod prefs;
 mod vault;
@@ -25,6 +26,7 @@ use adw::prelude::*;
 use gtk::{gio, glib};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 thread_local! {
@@ -39,6 +41,8 @@ const AUTO_SYNC: Duration = Duration::from_secs(10 * 60);
 /// the view that shows it.
 pub struct Session {
     pub keys: Keys,
+    /// What was copied from the generator, oldest first.
+    pub generated: Vec<generator::Generated>,
 }
 
 pub struct Ui {
@@ -46,10 +50,14 @@ pub struct Ui {
     toasts: adw::ToastOverlay,
     stack: gtk::Stack,
     login: pages::LoginPage,
+    two_factor: pages::TwoFactorPage,
     unlock: pages::UnlockPage,
     vault: vault::VaultView,
     account: RefCell<Option<Account>>,
     session: RefCell<Option<Session>>,
+    /// A login waiting for its second step. Shared with the worker that
+    /// tries a code; a result for any other login is dropped.
+    pending: RefCell<Option<Arc<session::PendingLogin>>>,
     /// Bumped on every lock, so work started before it is thrown away.
     epoch: Cell<u64>,
     syncing: Cell<bool>,
@@ -58,6 +66,8 @@ pub struct Ui {
     /// The reprompt item whose secrets the master password was re-entered
     /// for. Cleared when another item is shown.
     reprompt_passed: RefCell<Option<String>>,
+    /// The generator dialog, while it's open.
+    generator: RefCell<Option<adw::Dialog>>,
 }
 
 pub fn build(app: &adw::Application) -> Rc<Ui> {
@@ -77,9 +87,11 @@ pub fn build(app: &adw::Application) -> Rc<Ui> {
     window.set_content(Some(&toasts));
 
     let login = pages::LoginPage::new();
+    let two_factor = pages::TwoFactorPage::new();
     let unlock = pages::UnlockPage::new();
     let vault = vault::VaultView::new();
     stack.add_named(&login.root, Some("login"));
+    stack.add_named(&two_factor.root, Some("two-factor"));
     stack.add_named(&unlock.root, Some("unlock"));
     stack.add_named(&vault.root, Some("vault"));
     vault.add_breakpoints(&window);
@@ -89,17 +101,21 @@ pub fn build(app: &adw::Application) -> Rc<Ui> {
         toasts,
         stack,
         login,
+        two_factor,
         unlock,
         vault,
         account: RefCell::new(None),
         session: RefCell::new(None),
+        pending: RefCell::new(None),
         epoch: Cell::new(0),
         syncing: Cell::new(false),
         lock_timer: RefCell::new(None),
         sync_timer: RefCell::new(None),
         reprompt_passed: RefCell::new(None),
+        generator: RefCell::new(None),
     });
     ui.login.connect(&ui);
+    ui.two_factor.connect(&ui);
     ui.unlock.connect(&ui);
     ui.vault.connect(&ui);
     ui.add_actions(app);
@@ -112,6 +128,12 @@ pub fn build(app: &adw::Application) -> Rc<Ui> {
                 if settings::get().lock_with_screen && ui.is_unlocked() {
                     log::info!("the session locked; locking the vault");
                     ui.lock();
+                }
+                // A half-done login holds the master key; don't leave it
+                // waiting behind a locked screen.
+                if ui.pending.borrow().is_some() {
+                    log::info!("the session locked; dropping the unfinished login");
+                    ui.cancel_two_factor();
                 }
             }
         });
@@ -144,6 +166,7 @@ impl Ui {
         for action in [
             "lock",
             "sync",
+            "generator",
             "search",
             "copy-username",
             "copy-password",
@@ -152,9 +175,10 @@ impl Ui {
         ] {
             self.set_action_enabled(action, vault);
         }
-        self.set_action_enabled("logout", name != "login");
+        self.set_action_enabled("logout", matches!(name, "unlock" | "vault"));
         match name {
             "login" => self.login.focus(),
+            "two-factor" => self.two_factor.focus(),
             "unlock" => self.unlock.focus(),
             _ => {}
         }
@@ -214,32 +238,145 @@ impl Ui {
         self.login.set_busy(true);
         let ui = self.clone();
         glib::spawn_future_local(async move {
-            let (login_server, login_email) = (server.clone(), email.clone());
             let result = gio::spawn_blocking(move || {
-                let (account, user_key) = session::login(&login_server, &login_email, &password)?;
-                let (keys, vault) = session::open_cached(&account, user_key);
-                Ok::<_, session::Error>((account, keys, vault))
+                Ok::<_, session::Error>(match session::login(&server, &email, &password)? {
+                    session::Login::Done(account, user_key) => {
+                        let (keys, vault) = session::open_cached(&account, user_key);
+                        LoginStep::Opened(account, keys, vault)
+                    }
+                    session::Login::SecondStep(pending) => LoginStep::SecondStep(pending),
+                })
             })
             .await
             .unwrap_or_else(|_| Err(session::Error::Other("The login crashed.".into())));
             ui.login.set_busy(false);
             match result {
-                Ok((account, keys, vault)) => {
-                    settings::update(|s| {
-                        s.last_server = server;
-                        s.last_email = email.trim().to_string();
-                    });
+                Ok(LoginStep::Opened(account, keys, vault)) => ui.logged_in(account, keys, vault),
+                Ok(LoginStep::SecondStep(pending)) => {
                     ui.login.clear_password();
-                    ui.unlock.show_account(&account);
-                    ui.account.replace(Some(account));
-                    ui.opened(keys, vault);
+                    let pending = Arc::new(pending);
+                    ui.pending.replace(Some(pending.clone()));
+                    ui.two_factor.show(&pending);
+                    ui.show_page("two-factor");
+                    ui.two_factor_method_changed();
                 }
                 Err(error) => {
-                    log::warn!("login to {server} failed: {error}");
+                    log::warn!("login failed: {error}");
                     ui.login.fail(&error.to_string());
                 }
             }
         });
+    }
+
+    /// The server let us in, with or without a second step.
+    fn logged_in(self: &Rc<Self>, account: Account, keys: Keys, vault: Option<Vault>) {
+        settings::update(|s| {
+            s.last_server.clone_from(&account.server);
+            s.last_email.clone_from(&account.email);
+        });
+        self.pending.replace(None);
+        self.login.clear_password();
+        self.unlock.show_account(&account);
+        self.account.replace(Some(account));
+        self.opened(keys, vault);
+    }
+
+    /// The pending login, if `pending` is still it.
+    fn still_pending(&self, pending: &Arc<session::PendingLogin>) -> bool {
+        self.pending
+            .borrow()
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, pending))
+    }
+
+    /// Another method picked (or the page just shown): say what to do, and
+    /// email a code if that's the method and none is on its way.
+    fn two_factor_method_changed(self: &Rc<Self>) {
+        self.two_factor.show_method();
+        if self.two_factor.selected_method() == Some(crate::api::TwoFactorMethod::Email)
+            && !self.two_factor.email_sent.get()
+        {
+            self.send_email_code();
+        }
+        self.two_factor.focus();
+    }
+
+    fn send_email_code(self: &Rc<Self>) {
+        let Some(pending) = self.pending.borrow().clone() else {
+            return;
+        };
+        self.two_factor.email_sent.set(true);
+        self.two_factor.set_sending(true);
+        let ui = self.clone();
+        glib::spawn_future_local(async move {
+            let worker = pending.clone();
+            let result = gio::spawn_blocking(move || session::send_email_code(&worker))
+                .await
+                .unwrap_or_else(|_| Err(session::Error::Other("Sending crashed.".into())));
+            if !ui.still_pending(&pending) {
+                return;
+            }
+            ui.two_factor.set_sending(false);
+            match result {
+                Ok(()) => ui.toast(&match ui.two_factor.email_hint() {
+                    Some(address) => format!("Code sent to {address}"),
+                    None => "Code sent".to_string(),
+                }),
+                Err(error) => {
+                    log::warn!("could not send a login code: {error}");
+                    ui.two_factor.email_sent.set(false);
+                    ui.two_factor
+                        .fail(&format!("The code could not be sent. {error}"));
+                }
+            }
+        });
+    }
+
+    fn second_step(self: &Rc<Self>) {
+        let Some(pending) = self.pending.borrow().clone() else {
+            return;
+        };
+        let Some(method) = self.two_factor.selected_method() else {
+            return;
+        };
+        let code = self.two_factor.code();
+        if code.trim().is_empty() {
+            return self.two_factor.fail("Enter the code.");
+        }
+        let remember = self.two_factor.remember();
+        self.two_factor.set_busy(true);
+        let ui = self.clone();
+        glib::spawn_future_local(async move {
+            let worker = pending.clone();
+            let result = gio::spawn_blocking(move || {
+                let (account, user_key) = session::second_step(&worker, method, &code, remember)?;
+                let (keys, vault) = session::open_cached(&account, user_key);
+                Ok::<_, session::Error>((account, keys, vault))
+            })
+            .await
+            .unwrap_or_else(|_| Err(session::Error::Other("The login crashed.".into())));
+            if !ui.still_pending(&pending) {
+                return;
+            }
+            ui.two_factor.set_busy(false);
+            match result {
+                Ok((account, keys, vault)) => ui.logged_in(account, keys, vault),
+                Err(error) => {
+                    log::warn!("the second login step failed: {error}");
+                    ui.two_factor.fail(&error.to_string());
+                }
+            }
+        });
+    }
+
+    /// Back to the login page; the half-done login (and its master key)
+    /// is dropped.
+    fn cancel_two_factor(&self) {
+        self.pending.replace(None);
+        self.two_factor.set_busy(false);
+        if self.stack.visible_child_name().as_deref() == Some("two-factor") {
+            self.show_page("login");
+        }
     }
 
     fn unlock(self: &Rc<Self>, password: String) {
@@ -278,7 +415,10 @@ impl Ui {
     fn opened(self: &Rc<Self>, keys: Keys, vault: Option<Vault>) {
         let have_cache = vault.is_some();
         let vault = Rc::new(vault.unwrap_or_else(empty_vault));
-        self.session.replace(Some(Session { keys }));
+        self.session.replace(Some(Session {
+            keys,
+            generated: Vec::new(),
+        }));
         UNLOCKED.with(|u| u.set(true));
         self.vault.show_vault(self, vault, !have_cache);
         self.show_page("vault");
@@ -344,9 +484,11 @@ impl Ui {
                 Ok((account, Some(unlocked))) => {
                     ui.account.replace(Some(account));
                     let vault = Rc::new(unlocked.vault);
-                    ui.session.replace(Some(Session {
-                        keys: unlocked.keys,
-                    }));
+                    // New keys (a rotated key, a new organization); the
+                    // rest of the session stays.
+                    if let Some(session) = ui.session.borrow_mut().as_mut() {
+                        session.keys = unlocked.keys;
+                    }
                     ui.vault.show_vault(&ui, vault, false);
                 }
                 Err(session::Error::Api(crate::api::ApiError::SessionExpired)) => {
@@ -370,6 +512,9 @@ impl Ui {
         }
         self.epoch.set(self.epoch.get() + 1);
         self.vault.clear();
+        if let Some(dialog) = self.generator.take() {
+            dialog.force_close();
+        }
         self.session.replace(None);
         UNLOCKED.with(|u| u.set(false));
         self.reprompt_passed.replace(None);
@@ -539,6 +684,7 @@ impl Ui {
         action("open-website", &["<Control>o"], |ui| {
             ui.vault.copy_field(ui, vault::Quick::Website)
         });
+        action("generator", &["<Control>g"], generator::show);
         action("logout", &[], |ui| ui.confirm_logout());
         action("preferences", &["<Control>comma"], prefs::show);
         action("about", &[], |ui| ui.show_about());
@@ -556,6 +702,14 @@ impl Ui {
             .build();
         about.present(Some(&self.window));
     }
+}
+
+/// Where a login's first attempt left off.
+// Made once per login and moved once; its size doesn't matter.
+#[allow(clippy::large_enum_variant)]
+enum LoginStep {
+    Opened(Account, Keys, Option<Vault>),
+    SecondStep(session::PendingLogin),
 }
 
 fn empty_vault() -> Vault {
