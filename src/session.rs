@@ -117,7 +117,7 @@ pub fn unlock_with_pin(account: &Account, sealed: &str, pin: &str) -> Result<Sym
 
 /// Open the cached vault with a user key. `None` when there is no cache yet.
 pub fn open_cached(account: &Account, user_key: SymmetricKey) -> (Keys, Option<Vault>) {
-    let cache = store::load_vault();
+    let cache = store::load_vault(account);
     let keys = Keys::new(
         user_key,
         cache.as_ref().unwrap_or(&Value::Null),
@@ -307,9 +307,10 @@ fn finish(
         user_key: user_key_text,
         private_key: tokens.private_key,
     };
-    // A different account's cache must not be shown under this one.
-    store::forget();
-    account.save();
+    // An earlier login's cache and PIN of this account start over.
+    store::forget(&account);
+    account.create();
+    account.set_active();
     Ok((account, user_key))
 }
 
@@ -378,7 +379,7 @@ pub fn sync(mut account: Account) -> Result<(Account, Value), Error> {
         let since = store::vault_generation();
         let sync = authed(&mut account, |client, token| client.sync(token))?;
         tries += 1;
-        if store::save_synced_vault(&sync, since) || tries == 3 {
+        if store::save_synced_vault(&account, &sync, since) || tries == 3 {
             break sync;
         }
     };
@@ -785,7 +786,7 @@ pub fn change(mut account: Account, change: Change) -> Result<(Account, Value, T
         (_, Some(cipher)) => Touched::Item(id_of(cipher)?),
         (_, None) => Touched::Nothing,
     };
-    let sync = store::update_vault(|sync| match (&change, result) {
+    let sync = store::update_vault(&account, |sync| match (&change, result) {
         (Change::Purge(id), _) => replace_by_id(&mut sync["ciphers"], id, None),
         (Change::DeleteFolder(id), _) => {
             replace_by_id(&mut sync["folders"], id, None);
@@ -835,7 +836,7 @@ pub fn export(
 ) -> Result<(), Error> {
     use std::io::Write;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    let sync = store::load_vault()
+    let sync = store::load_vault(account)
         .ok_or_else(|| Error::Other("There's no synced vault to export yet.".into()))?;
     let data = crate::export::build(&sync, user_key, format, file_password, account.kdf)
         .map_err(|why| Error::Other(format!("Could not export the vault: {why}")))?;

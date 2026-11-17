@@ -33,8 +33,9 @@ fn main() -> anyhow::Result<()> {
         Some("list") => cli_list(),
         Some("generate") => cli_generate(&args[2..]),
         Some("export") => cli_export(&args[2..]),
+        Some("accounts") => cli_accounts(&args[2..]),
         Some("--help" | "-h" | "help") => {
-            println!("Vord {}: a Bitwarden / Vaultwarden vault for the desktop.\n\n  vord                     open the app\n  vord login SERVER EMAIL [--method authenticator|email|yubikey] [--remember]\n                           log in (master password, then any code, on stdin)\n  vord list                unlock, sync and list items (master password on stdin)\n  vord generate [password|passphrase|username]\n                           make one with the generator's saved options\n  vord export json|csv|encrypted_json|password_json FILE\n                           unlock, sync and export (master password, then any\n                           file password, on stdin)", env!("CARGO_PKG_VERSION"));
+            println!("Vord {}: a Bitwarden / Vaultwarden vault for the desktop.\n\n  vord                     open the app\n  vord login SERVER EMAIL [--method authenticator|email|yubikey] [--remember]\n                           log in (master password, then any code, on stdin)\n  vord list                unlock, sync and list items (master password on stdin)\n  vord generate [password|passphrase|username]\n                           make one with the generator's saved options\n  vord accounts [EMAIL]     list the accounts kept, or switch to one\n  vord export json|csv|encrypted_json|password_json FILE\n                           unlock, sync and export (master password, then any\n                           file password, on stdin)", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
         _ => {
@@ -196,6 +197,40 @@ fn cli_generate(args: &[String]) -> anyhow::Result<()> {
         }
     };
     println!("{value}");
+    Ok(())
+}
+
+/// `vord accounts [EMAIL]`: the accounts kept, the one in use marked; with
+/// an email, use that one.
+fn cli_accounts(args: &[String]) -> anyhow::Result<()> {
+    let accounts = store::accounts();
+    if let Some(email) = args.first() {
+        let found: Vec<_> = accounts
+            .iter()
+            .filter(|a| a.email.eq_ignore_ascii_case(email.trim()))
+            .collect();
+        match found[..] {
+            [account] => {
+                account.set_active();
+                println!("using {} on {}", account.email, account.server);
+                return Ok(());
+            }
+            [] => anyhow::bail!("no account {email}"),
+            _ => anyhow::bail!("{email} has accounts on several servers"),
+        }
+    }
+    let active = store::Account::load().map(|a| a.id());
+    for account in &accounts {
+        let mark = if Some(account.id()) == active {
+            "*"
+        } else {
+            " "
+        };
+        println!("{mark} {:<32} {}", account.email, account.server);
+    }
+    if accounts.is_empty() {
+        println!("no accounts; vord login SERVER EMAIL adds one");
+    }
     Ok(())
 }
 

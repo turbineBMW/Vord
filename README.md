@@ -48,6 +48,10 @@ Omarchy theme live.
   expiry, a view limit and a password; hide your email or deactivate one.
   The link is copied when a Send is made; everything in it, file included,
   is encrypted before it leaves, and the key travels only in the link.
+- Up to five accounts, on one server or several: switch from the main
+  menu or the lock screen (switching locks the one you leave), add one
+  with Add Account…, and log out of one without touching the others.
+  `vord accounts [EMAIL]` lists them or picks one from the terminal.
 - A tray icon (Preferences → Tray), for Waybar, Omarchy's shell and any
   other StatusNotifierItem host: click to show or hide Vord, or lock and
   quit from its menu. Closing the window can leave Vord running there.
@@ -81,7 +85,7 @@ The aim is to do what the Bitwarden desktop app does, in this order:
 5. ~~Sends: sharing text and files by link.~~ Done.
 6. ~~Exporting the vault, unlocking with a PIN, syncing the moment
    something changes on the server, an SSH agent for the vault's SSH
-   keys, a tray icon.~~ Done. More than one account.
+   keys, a tray icon, more than one account.~~ Done.
 7. Two-step login with Duo or a FIDO2 security key, logging in by approving
    from another device, and SSO.
 
@@ -122,9 +126,10 @@ Vord follows the Bitwarden client protocol and does all decryption locally:
   of it, the same one every Bitwarden app sends.
 - Vault data is AES-256-CBC with HMAC-SHA256. MACs are checked, in constant
   time, before anything is decrypted. Organization keys are RSA-OAEP.
-- On disk, `~/.local/share/vord` (mode 0700, files 0600) holds the server, the
-  email, the KDF settings, the session's refresh token, and the vault exactly
-  as the server sent it, still encrypted. This is what the official desktop
+- On disk, `~/.local/share/vord/accounts/<id>` (mode 0700, files 0600)
+  holds, for each account, the server, the email, the KDF settings, the
+  session's refresh token, and the vault exactly as the server sent it,
+  still encrypted. Logging out of an account deletes its directory. This is what the official desktop
   app keeps too, and it is why unlocking works offline. Nothing decrypted is
   ever written.
 - `device.json` there holds this device's id and, if you ticked "Remember

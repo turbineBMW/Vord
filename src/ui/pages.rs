@@ -118,6 +118,8 @@ fn error_label() -> gtk::Label {
 
 pub struct LoginPage {
     pub root: adw::ToolbarView,
+    /// Back to the account in use, while adding another.
+    cancel: gtk::Button,
     server: adw::EntryRow,
     email: adw::EntryRow,
     password: adw::PasswordEntryRow,
@@ -158,10 +160,21 @@ impl LoginPage {
         column.append(&brand);
         column.append(&group);
         column.append(&error);
+        let cancel = gtk::Button::builder()
+            .label("_Cancel")
+            .use_underline(true)
+            .action_name("win.cancel-add-account")
+            .css_classes(["flat"])
+            .halign(gtk::Align::Center)
+            .margin_top(6)
+            .visible(false)
+            .build();
         column.append(&button);
+        column.append(&cancel);
         column.append(&note);
         Self {
             root: frame(&column),
+            cancel,
             server,
             email,
             password,
@@ -205,6 +218,11 @@ impl LoginPage {
                 ui.login.password.grab_focus();
             }
         });
+    }
+
+    /// Whether this login adds an account beside one already kept.
+    pub fn set_adding(&self, adding: bool) {
+        self.cancel.set_visible(adding);
     }
 
     pub fn prefill(&self, server: &str, email: &str) {
@@ -468,6 +486,7 @@ impl TwoFactorPage {
 
 pub struct UnlockPage {
     pub root: adw::ToolbarView,
+    pub accounts: gtk::MenuButton,
     who: gtk::Label,
     password: adw::PasswordEntryRow,
     pin: adw::PasswordEntryRow,
@@ -515,7 +534,6 @@ impl UnlockPage {
             .action_name("win.logout")
             .css_classes(["flat"])
             .halign(gtk::Align::Center)
-            .margin_top(12)
             .build();
         let column = gtk::Box::new(gtk::Orientation::Vertical, 0);
         column.append(&brand);
@@ -523,10 +541,18 @@ impl UnlockPage {
         column.append(&group);
         column.append(&error);
         column.append(&button);
+        let accounts = gtk::MenuButton::builder()
+            .label("Accounts")
+            .css_classes(["flat"])
+            .halign(gtk::Align::Center)
+            .margin_top(12)
+            .build();
         column.append(&switch);
+        column.append(&accounts);
         column.append(&logout);
         Self {
             root: frame(&column),
+            accounts,
             who,
             password,
             pin,
