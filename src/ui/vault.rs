@@ -309,6 +309,7 @@ impl VaultView {
         let section = gio::Menu::new();
         section.append(Some("_Favorite"), Some("win.favorite"));
         section.append(Some("_Clone"), Some("win.clone-item"));
+        section.append(Some("Add _Attachment…"), Some("win.add-attachment"));
         item_menu.append_section(None, &section);
         let section = gio::Menu::new();
         for (label, action) in [
@@ -898,6 +899,7 @@ impl VaultView {
         let trashed = item.filter(|i| i.deleted);
         ui.set_action_enabled("edit-item", live.is_some_and(|i| i.edit && !i.damaged));
         ui.set_action_enabled("clone-item", live.is_some_and(|i| !i.damaged));
+        ui.set_action_enabled("add-attachment", live.is_some_and(|i| i.edit && !i.damaged));
         ui.set_action_enabled("favorite", live.is_some());
         if let Some(action) = ui
             .window

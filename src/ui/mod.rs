@@ -176,6 +176,7 @@ impl Ui {
             "search",
             "edit-item",
             "clone-item",
+            "add-attachment",
             "favorite",
             "trash-item",
             "restore-item",
@@ -928,6 +929,147 @@ impl Ui {
         );
     }
 
+    /// The key an item's fields (and its attachments' keys) are encrypted with.
+    fn key_of(&self, item_id: &str) -> Option<SymmetricKey> {
+        let vault = self.vault.current_vault()?;
+        let raw = vault.raw(item_id)?;
+        let session = self.session.borrow();
+        match edit::item_key(raw, &session.as_ref()?.keys) {
+            Ok(key) => Some(key),
+            Err(error) => {
+                log::warn!("cannot open the key of item {item_id}: {error}");
+                self.toast("This item's key won't open.");
+                None
+            }
+        }
+    }
+
+    /// Ask where to save an attachment, then fetch, decrypt and write it
+    /// there. The decrypted file goes only where the user chose.
+    pub fn save_attachment(self: &Rc<Self>, item_id: &str, attachment: &crate::vault::Attachment) {
+        let reprompt = self
+            .vault
+            .current_vault()
+            .and_then(|v| v.item(item_id).map(|i| i.reprompt))
+            .unwrap_or(false);
+        let ui = Rc::downgrade(self);
+        let (id, attachment) = (item_id.to_string(), attachment.clone());
+        let ask = move || {
+            let Some(ui) = ui.upgrade() else { return };
+            let dialog = gtk::FileDialog::builder()
+                .title("Save Attachment")
+                .initial_name(attachment.name.as_str())
+                .modal(true)
+                .build();
+            let (weak, id, attachment) = (Rc::downgrade(&ui), id.clone(), attachment.clone());
+            let epoch = ui.epoch.get();
+            dialog.save(Some(&ui.window), None::<&gio::Cancellable>, move |file| {
+                let Some(ui) = weak.upgrade().filter(|ui| ui.epoch.get() == epoch) else {
+                    return;
+                };
+                let Some(path) = file.ok().and_then(|f| f.path()) else {
+                    return;
+                };
+                ui.download_to(&id, &attachment, path);
+            });
+        };
+        if reprompt {
+            self.reprompt(item_id, ask);
+        } else {
+            ask();
+        }
+    }
+
+    fn download_to(
+        self: &Rc<Self>,
+        item_id: &str,
+        attachment: &crate::vault::Attachment,
+        path: std::path::PathBuf,
+    ) {
+        let Some(account) = self.account.borrow().clone() else {
+            return;
+        };
+        let Some(key) = self.key_of(item_id) else {
+            return;
+        };
+        let (id, attachment_id) = (item_id.to_string(), attachment.id.clone());
+        let name = attachment.name.clone();
+        self.toast(&format!("Saving {name}…"));
+        let epoch = self.epoch.get();
+        let ui = self.clone();
+        glib::spawn_future_local(async move {
+            let result = gio::spawn_blocking(move || {
+                let (account, data) =
+                    session::download_attachment(account, &id, &attachment_id, &key)?;
+                std::fs::write(&path, &*data)
+                    .map_err(|e| session::Error::Other(format!("Could not write the file: {e}")))?;
+                Ok::<_, session::Error>(account)
+            })
+            .await
+            .unwrap_or_else(|_| Err(session::Error::Other("Saving crashed.".into())));
+            match result {
+                Ok(account) => {
+                    ui.account.replace(Some(account));
+                    if ui.epoch.get() == epoch {
+                        ui.toast(&format!("Saved {name}"));
+                    }
+                }
+                Err(error) => {
+                    log::warn!("could not save an attachment: {error}");
+                    if ui.epoch.get() == epoch {
+                        ui.toast(&error.to_string());
+                    }
+                }
+            }
+        });
+    }
+
+    fn add_attachment(self: &Rc<Self>) {
+        let Some(id) = self.vault.selected_id() else {
+            return;
+        };
+        let dialog = gtk::FileDialog::builder()
+            .title("Add Attachment")
+            .modal(true)
+            .build();
+        let ui = Rc::downgrade(self);
+        let epoch = self.epoch.get();
+        dialog.open(Some(&self.window), None::<&gio::Cancellable>, move |file| {
+            let Some(ui) = ui.upgrade().filter(|ui| ui.epoch.get() == epoch) else {
+                return;
+            };
+            let Some(path) = file.ok().and_then(|f| f.path()) else {
+                return;
+            };
+            let Some(item_key) = ui.key_of(&id) else {
+                return;
+            };
+            ui.toast("Uploading…");
+            let change = session::Change::AddAttachment {
+                id: id.clone(),
+                path,
+                item_key,
+            };
+            ui.run_change(change, "Attachment added", |_, _| None);
+        });
+    }
+
+    pub fn delete_attachment(self: &Rc<Self>, item_id: &str, attachment: &str) {
+        let (id, attachment) = (item_id.to_string(), attachment.to_string());
+        self.confirm(
+            "Delete Attachment?",
+            "The file is deleted for good. This can't be undone.",
+            "_Delete",
+            move |ui| {
+                let change = session::Change::DeleteAttachment {
+                    id: id.clone(),
+                    attachment: attachment.clone(),
+                };
+                ui.run_change(change, "Attachment deleted", |_, _| None);
+            },
+        );
+    }
+
     /// Ask for a folder's name: a new folder, or a new name for `id`.
     fn folder_name_dialog(self: &Rc<Self>, folder: Option<(String, String)>) {
         if !self.is_unlocked() {
@@ -1130,6 +1272,7 @@ impl Ui {
         action("generator", &["<Control>g"], generator::show);
         action("edit-item", &["<Control>e"], |ui| ui.start_edit());
         action("clone-item", &[], |ui| ui.start_clone());
+        action("add-attachment", &[], |ui| ui.add_attachment());
         action("save-item", &["<Control>s"], |ui| ui.save_edit());
         action("cancel-edit", &[], |ui| ui.vault.end_edit(ui));
         action("trash-item", &[], |ui| ui.trash_item());

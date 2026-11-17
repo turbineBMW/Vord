@@ -572,10 +572,35 @@ pub fn build(ui: &Rc<Ui>, vault: &Vault, item: &Item) -> gtk::Widget {
 
     if !item.attachments.is_empty() {
         let group = b.group("Attachments");
-        group.set_description(Some("Vord can't download attachments yet."));
-        for name in &item.attachments {
-            let row = adw::ActionRow::builder().title(plain(name)).build();
+        let changeable = item.edit && !item.deleted;
+        for attachment in &item.attachments {
+            let row = adw::ActionRow::builder()
+                .title(plain(&attachment.name))
+                .subtitle(attachment.size.as_deref().map(plain).unwrap_or_default())
+                .build();
             row.add_prefix(&gtk::Image::from_icon_name("mail-attachment-symbolic"));
+            let save = icon_button("document-save-symbolic", "Save As…");
+            {
+                let ui = Rc::downgrade(ui);
+                let (id, attachment) = (item.id.clone(), attachment.clone());
+                save.connect_clicked(move |_| {
+                    if let Some(ui) = ui.upgrade() {
+                        ui.save_attachment(&id, &attachment);
+                    }
+                });
+            }
+            row.add_suffix(&save);
+            if changeable {
+                let delete = icon_button("user-trash-symbolic", "Delete Attachment…");
+                let ui = Rc::downgrade(ui);
+                let (id, attachment) = (item.id.clone(), attachment.id.clone());
+                delete.connect_clicked(move |_| {
+                    if let Some(ui) = ui.upgrade() {
+                        ui.delete_attachment(&id, &attachment);
+                    }
+                });
+                row.add_suffix(&delete);
+            }
             group.add(&row);
         }
     }

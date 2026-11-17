@@ -127,11 +127,34 @@ async function call(method, path, body, token, form) {
   });
   const add = (c) => call("POST", "/api/ciphers", cipher(userKey, c), token);
 
-  await add({
+  // An attachment as Bitwarden's apps make one: a key of its own, sealed
+  // with the item's key; the file is the type byte 2, IV, MAC, ciphertext.
+  const attach = async (cipherId, key, name, contents) => {
+    const fileKey = crypto.randomBytes(64);
+    const k = split(fileKey);
+    const iv = crypto.randomBytes(16);
+    const c = crypto.createCipheriv("aes-256-cbc", k.enc, iv);
+    const ct = Buffer.concat([c.update(contents), c.final()]);
+    const mac = crypto.createHmac("sha256", k.mac).update(Buffer.concat([iv, ct])).digest();
+    const data = Buffer.concat([Buffer.from([2]), iv, mac, ct]);
+    const fileName = enc(key, name);
+    const slot = await call("POST", `/api/ciphers/${cipherId}/attachment/v2`, { key: enc(key, fileKey), fileName, fileSize: data.length, adminRequest: false }, token);
+    const form = new FormData();
+    form.append("data", new Blob([data]), fileName);
+    const res = await fetch(`${SERVER}/api/ciphers/${cipherId}/attachment/${slot.attachmentId ?? slot.AttachmentId}`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}` },
+      body: form,
+    });
+    if (!res.ok) throw new Error(`attachment upload: ${res.status} ${await res.text()}`);
+  };
+
+  const github = await add({
     type: 1, folderId: work, favorite: true, name: "GitHub",
     login: { username: "octocat", password: "gh-Pa55word!", totp: "otpauth://totp/GitHub:octocat?secret=JBSWY3DPEHPK3PXP&issuer=GitHub", uris: ["https://github.com/login"] },
     fields: [{ type: 0, name: "Recovery email", value: "octo@example.com" }, { type: 1, name: "PIN", value: "4321" }, { type: 2, name: "Admin", value: "true" }],
   });
+  await attach(github.id ?? github.Id, userKey, "recovery-codes.txt", "1111-2222\n3333-4444\n");
   await add({ type: 1, folderId: work, name: "Basecamp", login: { username: "me@example.com", password: "bc-secret", uris: ["https://launchpad.37signals.com"] } });
   await add({ type: 1, folderId: personal, name: "Netflix", reprompt: 1, login: { username: "family@example.com", password: "n3tfl1x", uris: ["netflix.com"] } });
   await add({ type: 1, name: "Router admin", login: { username: "admin", password: "hunter2", uris: ["http://192.168.1.1"] }, notes: "Model AX-3000\nReset button on the back." });

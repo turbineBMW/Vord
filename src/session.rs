@@ -366,12 +366,105 @@ pub enum Change {
     Restore(String),
     /// Delete for good.
     Purge(String),
+    /// Attach a file to an item: read, encrypted with a new key of its own
+    /// (sealed with `item_key`) and uploaded, all on the worker.
+    AddAttachment {
+        id: String,
+        path: std::path::PathBuf,
+        item_key: SymmetricKey,
+    },
+    DeleteAttachment {
+        id: String,
+        attachment: String,
+    },
     /// Create (`id` is `None`) or rename a folder; `name` is encrypted.
     SaveFolder {
         id: Option<String>,
         name: String,
     },
     DeleteFolder(String),
+}
+
+fn upload_attachment(
+    client: &Client,
+    token: &str,
+    id: &str,
+    path: &std::path::Path,
+    item_key: &SymmetricKey,
+) -> Result<(), ApiError> {
+    let plain = Zeroizing::new(
+        std::fs::read(path)
+            .map_err(|e| ApiError::Other(format!("Could not read the file: {e}")))?,
+    );
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "attachment".into());
+    let key = SymmetricKey::generate();
+    let data = key.encrypt_file(&plain);
+    drop(plain);
+    let file_name = item_key.encrypt_text(&name);
+    let body = serde_json::json!({
+        "key": item_key.encrypt(&key.to_bytes()).to_string(),
+        "fileName": file_name,
+        "fileSize": data.len(),
+        "adminRequest": false,
+    });
+    let slot = client.call(
+        reqwest::Method::POST,
+        &format!("/api/ciphers/{id}/attachment/v2"),
+        token,
+        Some(&body),
+    )?;
+    let attachment = slot
+        .get("attachmentId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ApiError::Other("The server didn't make room for the file.".into()))?;
+    // 0: straight to the server (Vaultwarden); 1: to Azure (bitwarden.com).
+    match slot.get("fileUploadType").and_then(Value::as_u64) {
+        Some(1) => {
+            let url = slot.get("url").and_then(Value::as_str).ok_or_else(|| {
+                ApiError::Other("The server gave no address for the file.".into())
+            })?;
+            client.put_blob(url, data)
+        }
+        _ => client.upload(
+            &format!("/api/ciphers/{id}/attachment/{attachment}"),
+            token,
+            &file_name,
+            data,
+        ),
+    }
+}
+
+/// Fetch an attachment and decrypt it. `item_key` is the key the item's
+/// fields are encrypted with ([`crate::edit::item_key`]).
+pub fn download_attachment(
+    mut account: Account,
+    id: &str,
+    attachment: &str,
+    item_key: &SymmetricKey,
+) -> Result<(Account, Zeroizing<Vec<u8>>), Error> {
+    let (info, data) = authed(&mut account, |client, token| {
+        let path = format!("/api/ciphers/{id}/attachment/{attachment}");
+        let info = client.call(reqwest::Method::GET, &path, token, None)?;
+        let url = info
+            .get("url")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ApiError::Other("The server gave no address for the file.".into()))?;
+        let data = client.fetch(url)?;
+        Ok((info, data))
+    })?;
+    // A file from an older app has no key of its own: the item's opens it.
+    let key = match info
+        .get("key")
+        .and_then(Value::as_str)
+        .filter(|k| !k.is_empty())
+    {
+        Some(sealed) => SymmetricKey::from_bytes(&sealed.parse::<EncString>()?.decrypt(item_key)?)?,
+        None => item_key.clone(),
+    };
+    Ok((account, key.decrypt_file(&data)?))
 }
 
 /// What a change touched, for the view to select.
@@ -496,6 +589,15 @@ pub fn change(mut account: Account, change: Change) -> Result<(Account, Value, T
             Change::DeleteFolder(id) => {
                 call(Method::DELETE, &format!("/api/folders/{id}"), None)?;
                 None
+            }
+            Change::AddAttachment { id, path, item_key } => {
+                upload_attachment(client, token, id, path, item_key)?;
+                Some(call(Method::GET, &format!("/api/ciphers/{id}"), None)?)
+            }
+            Change::DeleteAttachment { id, attachment } => {
+                let path = format!("/api/ciphers/{id}/attachment/{attachment}");
+                call(Method::DELETE, &path, None)?;
+                Some(call(Method::GET, &format!("/api/ciphers/{id}"), None)?)
             }
         })
     })
@@ -764,6 +866,65 @@ mod live {
         let (account, sync, _) = change(account, save).unwrap();
         let vault = open(&account, &user_key, &sync);
         assert_eq!(vault.item(&id).unwrap().collection_ids, [second]);
+
+        // An attachment: up, down again unchanged, deleted.
+        let file = dir.path().join("receipt.txt");
+        let contents = b"Vord attachment test\n".repeat(1000);
+        std::fs::write(&file, &contents).unwrap();
+        let unlocked = open_sync(&account, user_key.clone(), &sync);
+        let raw = unlocked.vault.raw(&id).unwrap().clone();
+        let item_key = edit::item_key(&raw, &unlocked.keys).unwrap();
+        let add = Change::AddAttachment {
+            id: id.clone(),
+            path: file,
+            item_key: item_key.clone(),
+        };
+        let (account, sync, _) = change(account, add).unwrap();
+        let vault = open(&account, &user_key, &sync);
+        let attached = &vault.item(&id).unwrap().attachments;
+        assert_eq!(attached.len(), 1);
+        assert_eq!(attached[0].name, "receipt.txt");
+        let attachment = attached[0].id.clone();
+        let (account, data) = download_attachment(account, &id, &attachment, &item_key).unwrap();
+        assert_eq!(*data, contents);
+        let delete = Change::DeleteAttachment {
+            id: id.clone(),
+            attachment,
+        };
+        let (account, sync, _) = change(account, delete).unwrap();
+        assert!(open(&account, &user_key, &sync)
+            .item(&id)
+            .unwrap()
+            .attachments
+            .is_empty());
+
+        // Files other apps made open (tests/seed.js puts one on GitHub);
+        // one Vord makes stays on Router admin, to open in another client.
+        let vault = open(&account, &user_key, &sync);
+        let keys = open_sync(&account, user_key.clone(), &sync).keys;
+        let github = vault.items.iter().find(|i| i.name == "GitHub").unwrap();
+        let codes = github
+            .attachments
+            .iter()
+            .find(|a| a.name == "recovery-codes.txt");
+        let codes = codes.expect("tests/seed.js's attachment").id.clone();
+        let github_key = edit::item_key(vault.raw(&github.id).unwrap(), &keys).unwrap();
+        let (account, data) =
+            download_attachment(account, &github.id, &codes, &github_key).unwrap();
+        assert_eq!(*data, b"1111-2222\n3333-4444\n");
+        let router = vault
+            .items
+            .iter()
+            .find(|i| i.name == "Router admin")
+            .unwrap();
+        let file = dir.path().join("vord-upload.txt");
+        std::fs::write(&file, "made by Vord\n").unwrap();
+        let add = Change::AddAttachment {
+            id: router.id.clone(),
+            path: file,
+            item_key: edit::item_key(vault.raw(&router.id).unwrap(), &keys).unwrap(),
+        };
+        let (account, _, _) = change(account, add).unwrap();
 
         // The folder goes; the cache matches a fresh sync.
         let (account, sync, _) = change(account, Change::DeleteFolder(folder.clone())).unwrap();

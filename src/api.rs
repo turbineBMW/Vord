@@ -21,6 +21,8 @@ const CLIENT_ID: &str = "desktop";
 /// leaves SSH keys out of a sync for clients before 2024.12), so Vord states
 /// the desktop release whose item types it reads.
 const CLIENT_VERSION: &str = "2025.6.0";
+/// How long a file upload or download may take.
+const TRANSFER: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Debug)]
 pub enum ApiError {
@@ -474,6 +476,84 @@ impl Client {
             401 => Err(ApiError::SessionExpired),
             _ => Err(error_from(status, &body)),
         }
+    }
+
+    /// Upload a file in a multipart form, as a field called `data`.
+    pub fn upload(
+        &self,
+        path: &str,
+        access_token: &str,
+        file_name: &str,
+        data: Vec<u8>,
+    ) -> Result<(), ApiError> {
+        let part = reqwest::blocking::multipart::Part::bytes(data)
+            .file_name(file_name.to_string())
+            .mime_str("application/octet-stream")
+            .expect("a valid type");
+        let form = reqwest::blocking::multipart::Form::new().part("data", part);
+        let response = self
+            .http
+            .post(self.url(path))
+            .bearer_auth(access_token)
+            .multipart(form)
+            .timeout(TRANSFER)
+            .send()
+            .map_err(network)?;
+        let (status, body) = Self::read(response)?;
+        match status.as_u16() {
+            200..=299 => Ok(()),
+            401 => Err(ApiError::SessionExpired),
+            _ => Err(error_from(status, &body)),
+        }
+    }
+
+    /// Put a file to the blob storage bitwarden.com hands out (Azure); the
+    /// URL carries its own permission, so no token goes with it.
+    pub fn put_blob(&self, url: &str, data: Vec<u8>) -> Result<(), ApiError> {
+        let response = self
+            .http
+            .put(url)
+            .header("x-ms-blob-type", "BlockBlob")
+            .header("x-ms-version", "2020-04-08")
+            .body(data)
+            .timeout(TRANSFER)
+            .send()
+            .map_err(network)?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(ApiError::Other(format!(
+                "The file store answered {}.",
+                response.status()
+            )))
+        }
+    }
+
+    /// Fetch a file from the address the server gave for it. It's on the
+    /// server, or on a file store whose URL carries its own permission, so
+    /// no token goes with it.
+    pub fn fetch(&self, url: &str) -> Result<Vec<u8>, ApiError> {
+        let url = if url.starts_with('/') {
+            self.url(url)
+        } else {
+            url.to_string()
+        };
+        let response = self
+            .http
+            .get(url)
+            .timeout(TRANSFER)
+            .send()
+            .map_err(network)?;
+        if !response.status().is_success() {
+            return Err(ApiError::Other(format!(
+                "The file couldn't be fetched ({}).",
+                response.status()
+            )));
+        }
+        response
+            .bytes()
+            .map(|b| b.to_vec())
+            .map_err(|e| ApiError::Network(e.to_string()))
     }
 
     /// A website's icon from the server's icon service. `None` when it has

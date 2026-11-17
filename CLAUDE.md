@@ -24,7 +24,8 @@ profile; `XDG_CONFIG_HOME`/`XDG_CACHE_HOME` do the same for settings and icons.
 
 ```
 src/crypto.rs    KDF (PBKDF2/Argon2id), master password hash, HKDF stretch, EncString
-                 types 0/2 (AES-CBC + HMAC) and 3/4 (RSA-OAEP); keys zeroize on drop
+                 types 0/2 (AES-CBC + HMAC) and 3/4 (RSA-OAEP), attachment files
+                 (type byte, IV, MAC, data); keys zeroize on drop
 src/api.rs       prelogin, password + refresh grants (2FA: TwoFactorChallenge, SecondFactor),
                  send-email-login, sync, icons; `camel()` lower-cases the first letter of
                  every JSON key (Vaultwarden answers PascalCase)
@@ -63,7 +64,8 @@ tests/two-factor.js  turns on authenticator + email 2FA for it; prints TOTP / em
 
 ## Rules
 
-- **Nothing decrypted touches disk or logs.** `Debug` on keys, `Account` and `Totp` hides
+- **Nothing decrypted touches disk or logs**, except an attachment the user saves, to
+  the path they picked. `Debug` on keys, `Account` and `Totp` hides
   secrets; don't `{:?}` a struct holding them.
 - **A login waiting for its second step** holds the master key in `Ui::pending`
   (`Arc<PendingLogin>`). Cancel and screen lock drop it; worker results check
@@ -116,7 +118,9 @@ cargo run -- login http://localhost:8222 test@vord.test [--method email] [--reme
 
 Writes against the seeded server: `cargo test -- --ignored live_changes` (folders,
 favorite, trash, restore, purge, refusing a stale copy, moving into the organization
-and between its collections; it adds a collection each run). Vaultwarden only refuses a
+and between its collections, attachments both ways; it adds a collection and a
+`vord-upload.txt` on Router admin, to open in another client, each run). tests/seed.js puts recovery-codes.txt
+on GitHub, encrypted independently, for Vord to open. Vaultwarden only refuses a
 stale copy when the item changed more than a second after it.
 
 Bitwarden's own web vault comes with Vaultwarden and is the check that what Vord
