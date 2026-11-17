@@ -149,7 +149,7 @@ pub struct PendingLogin {
     /// The masked address email codes go to.
     pub email_hint: Option<String>,
     /// Whether the server emailed a code on its own (it does when email is
-    /// the account's only second step).
+    /// the account's only second step, and for a new device's code).
     pub email_sent: bool,
 }
 
@@ -205,8 +205,15 @@ pub fn login(server: &str, email: &str, password: &str) -> Result<Login, Error> 
                      Add an authenticator app or email as a second method in the web vault to log in here."
                 )));
             }
-            let email_sent =
-                challenge.offered == 1 && challenge.methods == [TwoFactorMethod::Email];
+            let new_device = challenge.methods == [TwoFactorMethod::NewDevice];
+            let email_sent = new_device
+                || challenge.offered == 1 && challenge.methods == [TwoFactorMethod::Email];
+            // A new device's code goes to the account's own address.
+            let email_hint = if new_device {
+                Some(email.trim().to_string())
+            } else {
+                challenge.email_hint
+            };
             Ok(Login::SecondStep(PendingLogin {
                 server: server.to_string(),
                 email: email.trim().to_string(),
@@ -215,7 +222,7 @@ pub fn login(server: &str, email: &str, password: &str) -> Result<Login, Error> 
                 password_hash,
                 device_id,
                 methods: challenge.methods,
-                email_hint: challenge.email_hint,
+                email_hint,
                 email_sent,
             }))
         }
@@ -267,13 +274,14 @@ pub fn second_step(
     )
 }
 
-/// Ask the server to email a login code.
+/// Ask the server to email a login code (again, for a new device's code).
 pub fn send_email_code(pending: &PendingLogin) -> Result<(), Error> {
-    Client::new(&pending.server).send_email_code(
-        &pending.email,
-        &pending.password_hash,
-        &pending.device_id,
-    )?;
+    let client = Client::new(&pending.server);
+    if pending.methods == [TwoFactorMethod::NewDevice] {
+        client.send_new_device_code(&pending.email, &pending.password_hash, &pending.device_id)?;
+    } else {
+        client.send_email_code(&pending.email, &pending.password_hash, &pending.device_id)?;
+    }
     Ok(())
 }
 
