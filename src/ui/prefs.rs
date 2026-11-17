@@ -119,6 +119,7 @@ pub fn show(ui: &Rc<Ui>) {
     if ui.is_unlocked() {
         page.add(&pin_group(ui, &dialog));
     }
+    page.add(&agent_group(ui, &current));
 
     if let Some(account) = ui.account.borrow().as_ref() {
         let group = adw::PreferencesGroup::builder().title("Account").build();
@@ -158,6 +159,69 @@ pub fn show(ui: &Rc<Ui>) {
         page.add(&group);
     }
     dialog.present(Some(&ui.window));
+}
+
+/// The SSH agent: on or off, where it listens, when it asks.
+fn agent_group(ui: &Rc<Ui>, current: &settings::Settings) -> adw::PreferencesGroup {
+    let path = crate::agent::socket_path();
+    let group = adw::PreferencesGroup::builder()
+        .title("SSH Agent")
+        .description("Lets ssh and git use the vault's SSH keys, as Bitwarden's desktop app does.")
+        .build();
+    let on = adw::SwitchRow::builder()
+        .title("Serve SSH keys")
+        .subtitle("Point SSH_AUTH_SOCK at the socket below")
+        .active(current.ssh_agent)
+        .build();
+    let weak = Rc::downgrade(ui);
+    on.connect_active_notify(move |row| {
+        let on = row.is_active();
+        settings::update(|s| s.ssh_agent = on);
+        if let Some(ui) = weak.upgrade() {
+            if on {
+                super::agent::start(&ui);
+            } else {
+                super::agent::stop(&ui);
+            }
+        }
+    });
+    group.add(&on);
+    let line = format!("export SSH_AUTH_SOCK={}", path.display());
+    let socket = adw::ActionRow::builder()
+        .title("Socket")
+        .subtitle(glib_escape(&line))
+        .subtitle_selectable(true)
+        .css_classes(["property", "monospace-value"])
+        .build();
+    let copy = gtk::Button::builder()
+        .icon_name("edit-copy-symbolic")
+        .tooltip_text("Copy")
+        .valign(gtk::Align::Center)
+        .css_classes(["flat"])
+        .build();
+    let weak = Rc::downgrade(ui);
+    copy.connect_clicked(move |_| {
+        if let Some(ui) = weak.upgrade() {
+            ui.copy("Line", &line, false);
+        }
+    });
+    socket.add_suffix(&copy);
+    on.bind_property("active", &socket, "sensitive")
+        .sync_create()
+        .build();
+    group.add(&socket);
+    let ask = choice_row(
+        "Ask before using a key",
+        "Vord shows which program wants it",
+        &[(0, "Every time"), (1, "Once until locked"), (2, "Never")],
+        current.ssh_agent_ask,
+        |value| settings::update(|s| s.ssh_agent_ask = value),
+    );
+    on.bind_property("active", &ask, "sensitive")
+        .sync_create()
+        .build();
+    group.add(&ask);
+    group
 }
 
 /// Unlock with PIN: turning it on asks for the PIN; keeping it across

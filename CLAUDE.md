@@ -26,6 +26,9 @@ profile; `XDG_CONFIG_HOME`/`XDG_CACHE_HOME` do the same for settings and icons.
 src/crypto.rs    KDF (PBKDF2/Argon2id), master password hash, HKDF stretch, EncString
                  types 0/2 (AES-CBC + HMAC) and 3/4 (RSA-OAEP), attachment files
                  (type byte, IV, MAC, data); keys zeroize on drop
+src/agent.rs     the SSH agent: socket in $XDG_RUNTIME_DIR/vord, list + sign (RSA by
+                 hand: ssh-key 0.6 passes the first prime twice); ui/agent.rs keeps
+                 the public keys, asks before signing, waits for an unlock
 src/api.rs       prelogin, password + refresh grants (2FA: TwoFactorChallenge, SecondFactor),
                  send-email-login, sync, icons; `camel()` lower-cases the first letter of
                  every JSON key (Vaultwarden answers PascalCase)

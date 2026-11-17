@@ -48,6 +48,11 @@ Omarchy theme live.
   expiry, a view limit and a password; hide your email or deactivate one.
   The link is copied when a Send is made; everything in it, file included,
   is encrypted before it leaves, and the key travels only in the link.
+- An SSH agent for the vault's SSH keys (Ed25519, RSA, ECDSA), off until
+  you turn it on in Preferences: point `SSH_AUTH_SOCK` at its socket and
+  `ssh` and `git` use them. Vord asks before a key signs (every time, once
+  until locking, or never) and says which program asked; a request while
+  locked brings Vord up to be unlocked.
 - Unlocking with a PIN, as Bitwarden's apps do: after the master password
   once per start, or across restarts if you choose. Five wrong PINs and
   the master password is needed again.
@@ -72,8 +77,8 @@ The aim is to do what the Bitwarden desktop app does, in this order:
 4. ~~Attachments: downloading and uploading them.~~ Done.
 5. ~~Sends: sharing text and files by link.~~ Done.
 6. ~~Exporting the vault, unlocking with a PIN, syncing the moment
-   something changes on the server.~~ Done. An SSH agent for the vault's SSH
-   keys, more than one account, and a tray icon.
+   something changes on the server, an SSH agent for the vault's SSH
+   keys.~~ Done. More than one account, and a tray icon.
 7. Two-step login with Duo or a FIDO2 security key, logging in by approving
    from another device, and SSO.
 
@@ -140,6 +145,10 @@ Vord follows the Bitwarden client protocol and does all decryption locally:
   across restarts, that seal is written to `pin.json`; a short PIN then
   protects your vault from anyone who copies your files only as far as the
   KDF slows them down.
+- The SSH agent's socket is in `$XDG_RUNTIME_DIR/vord` (mode 0700) and
+  refuses other users' processes. A private key is decrypted for one
+  signature at a time. The keys' public halves and names stay in memory
+  after locking, so `ssh` can still offer one; logging out forgets them.
 - Keys are zeroed when the vault locks, and every widget that showed
   decrypted text is destroyed, including an editor with unsaved changes.
 
