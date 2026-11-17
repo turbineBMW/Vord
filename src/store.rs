@@ -186,11 +186,48 @@ pub fn load_vault() -> Option<serde_json::Value> {
     serde_json::from_slice(&bytes).ok()
 }
 
-pub fn save_vault(sync: &serde_json::Value) {
+fn write_vault(sync: &serde_json::Value) {
     let bytes = serde_json::to_vec(sync).expect("serialisable");
     if let Err(error) = write_private(&dir().join("vault.json"), &bytes) {
         log::error!("could not save the vault cache: {error}");
     }
+}
+
+/// Bumped by every change Vord makes to the cache, so a sync that was on
+/// the wire meanwhile doesn't put the old copy back.
+static VAULT_GENERATION: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
+
+fn generation() -> std::sync::MutexGuard<'static, u64> {
+    VAULT_GENERATION
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Read before a sync goes out; see [`save_synced_vault`].
+pub fn vault_generation() -> u64 {
+    *generation()
+}
+
+/// Keep a fresh sync, unless Vord changed the vault since `since` (then
+/// the sync is already out of date: false).
+pub fn save_synced_vault(sync: &serde_json::Value, since: u64) -> bool {
+    let generation = generation();
+    if *generation != since {
+        return false;
+    }
+    write_vault(sync);
+    true
+}
+
+/// Change the cached vault after a write the server accepted, and return
+/// it as it now is.
+pub fn update_vault(change: impl FnOnce(&mut serde_json::Value)) -> serde_json::Value {
+    let mut generation = generation();
+    let mut sync = load_vault().unwrap_or_else(|| serde_json::json!({}));
+    change(&mut sync);
+    write_vault(&sync);
+    *generation += 1;
+    sync
 }
 
 /// Log out: forget the account and the cached vault. Settings, the icon

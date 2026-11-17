@@ -1,4 +1,4 @@
-//! The Bitwarden client crypto Vord needs to read a vault.
+//! The Bitwarden client crypto Vord needs to read and write a vault.
 //!
 //! - The master key comes from the master password and the account's KDF:
 //!   PBKDF2-SHA256 salted with the email, or Argon2id salted with the email's
@@ -13,7 +13,6 @@
 //!
 //! Keys zero their bytes when dropped.
 
-#[cfg(test)]
 use aes::cipher::BlockEncryptMut;
 use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
 use base64::engine::general_purpose::STANDARD as B64;
@@ -25,7 +24,6 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 type HmacSha256 = Hmac<Sha256>;
 type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
-#[cfg(test)]
 type Aes256CbcEnc = cbc::Encryptor<aes::Aes256>;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -222,6 +220,16 @@ impl SymmetricKey {
         Self::from_bytes(&*bytes).expect("64 bytes")
     }
 
+    /// Whether this key can encrypt (it has a MAC half).
+    pub fn can_encrypt(&self) -> bool {
+        self.mac.is_some()
+    }
+
+    /// Encrypt text, as the string the server stores.
+    pub fn encrypt_text(&self, plain: &str) -> String {
+        self.encrypt(plain.as_bytes()).to_string()
+    }
+
     #[cfg(test)]
     pub fn to_bytes(&self) -> Zeroizing<Vec<u8>> {
         let mut out = Zeroizing::new(self.enc.to_vec());
@@ -231,9 +239,10 @@ impl SymmetricKey {
         out
     }
 
-    /// Encrypt as a type 2 EncString. Vord only reads vaults; this is here
-    /// for the tests.
-    #[cfg(test)]
+    /// Encrypt as a type 2 EncString (AES-256-CBC, HMAC-SHA256), with a
+    /// fresh random IV. Every key Vord writes with has a MAC half: user and
+    /// organisation keys have had one since 2018, and legacy 32-byte keys
+    /// are refused when the item is opened for editing.
     pub fn encrypt(&self, plain: &[u8]) -> EncString {
         use rand::RngCore;
         let mac_key = self.mac.expect("type 2 needs a MAC key");

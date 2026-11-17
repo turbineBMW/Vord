@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Vord is a read-only Bitwarden/Vaultwarden client: GTK 4 / libadwaita, Rust, one crate
+Vord is a Bitwarden/Vaultwarden client: GTK 4 / libadwaita, Rust, one crate
 (app id `io.github.turbinebmw.Vord`). Siblings: `~/Projects/Rustle`, `~/Projects/Bubo`,
 `~/Projects/Gaze`. The look (three panes, Omarchy palette, see-through sidebars) is
 theirs; `omarchy/`, `sidebar.rs` and `accent.rs` are ports of Bubo's, so keep them in step.
@@ -29,10 +29,14 @@ src/api.rs       prelogin, password + refresh grants (2FA: TwoFactorChallenge, S
                  send-email-login, sync, icons; `camel()` lower-cases the first letter of
                  every JSON key (Vaultwarden answers PascalCase)
 src/session.rs   login (Done | SecondStep(PendingLogin)) / second_step / unlock_key / sync /
-                 open_sync: blocking, run on workers
+                 open_sync / change (save, favorite, trash, restore, purge, folders):
+                 blocking, run on workers; `change` folds the answer into vault.json
 src/store.rs     account.json + vault.json (still encrypted) in $XDG_DATA_HOME/vord, 0600;
-                 device.json (device id + remember-2FA tokens) outlives logout
-src/vault.rs     the decrypted model; one bad item is marked `damaged`, never fatal
+                 device.json (device id + remember-2FA tokens) outlives logout; a
+                 generation counter keeps a sync from overwriting a change made meanwhile
+src/vault.rs     the decrypted model; one bad item is marked `damaged`, never fatal;
+                 `Vault::raw` keeps each item as the server sent it
+src/edit.rs      Draft (an item as an editor holds it) and `request`, the body that saves it
 src/generator.rs passwords / passphrases / usernames, Bitwarden's rules; EFF list in data/
 src/totp.rs      otpauth://, steam://, bare base32; RFC 6238 vectors in the tests
 src/clipboard.rs secret copies carry x-kde-passwordManagerHint=secret; auto-clear
@@ -48,6 +52,7 @@ src/ui/vault.rs  the three panes; Filter; breakpoints (900sp folds the vault sid
 src/ui/detail.rs one item's widgets, rebuilt per selection; TOTP ticks on a timer that
                  stops when its label is gone
 src/ui/generator.rs the generator dialog; copied values live in Session.generated
+src/ui/editor.rs the item editor, shown in the details pane while editing
 src/ui/pages.rs  login, two-step and unlock pages;  src/ui/prefs.rs  preferences
 src/style.css    app CSS; colours only from libadwaita variables
 tests/vectors.js independent crypto vectors (Node) -> tests/vectors/*
@@ -72,6 +77,15 @@ tests/two-factor.js  turns on authenticator + email 2FA for it; prints TOTP / em
   come back in `glib::spawn_future_local`. Only the main loop touches state and widgets.
 - **List boxes are never changed inside their own selection signals:** handlers defer
   through an idle, and rebuilds set `rebuilding` so the signals they cause are ignored.
+- **Edits start from the raw item** (`Vault::raw`), never from the model: unchanged
+  fields keep their ciphertext and unknown keys pass through, so a save can't drop
+  what Vord doesn't model. Encrypt with `edit::item_key` (the item's own key when it
+  has one). New URIs need a `uriChecksum`, or Bitwarden's apps drop them from items
+  with their own key; Vaultwarden wants `encryptedFor` (the user id). A damaged item
+  can't be edited. Check `request` changes against the web vault (see below).
+- **While editing** the lists, search and sync button are insensitive and
+  `show_detail` leaves the form alone; dialogs over the vault go through
+  `Ui::present_dialog` so locking closes them.
 - Servers hide item types from old clients (Vaultwarden drops SSH keys before 2024.12);
   `api::CLIENT_VERSION` is sent on every request for that reason.
 - Commits: Conventional Commits, terse.
@@ -99,6 +113,17 @@ node tests/seed.js && node tests/two-factor.js enable
 cargo run -- login http://localhost:8222 test@vord.test [--method email] [--remember]
 ```
 
+Writes against the seeded server: `cargo test -- --ignored live_changes` (folders,
+favorite, trash, restore, purge, refusing a stale copy). Vaultwarden only refuses a
+stale copy when the item changed more than a second after it.
+
+Bitwarden's own web vault comes with Vaultwarden and is the check that what Vord
+writes opens elsewhere, but it refuses plain http. Put TLS in front:
+`docker run -d --name vord-test-tls --network vord-test -p 127.0.0.1:8443:8443 caddy:2
+caddy reverse-proxy --from https://localhost:8443 --to http://vord-test-vw:80` and
+open https://localhost:8443 in a browser that skips the certificate check
+(Chromium's `--ignore-certificate-errors`, in a throwaway profile).
+
 Plain http is accepted only for loopback addresses. To see the UI without putting a
 window on screen, run it under GTK's Broadway backend (`gtk4-broadwayd :7`, then
 `GDK_BACKEND=broadway BROADWAY_DISPLAY=:7`) and open http://127.0.0.1:8080 (or the
@@ -107,4 +132,7 @@ reconnect to refresh. Vord is single-instance over D-Bus: if Vord is already
 running, a test launch just raises that window, so start it under
 `dbus-run-session --`, with `GDK_DEBUG=no-portals` (portals started on that bus crash
 and leave core dumps, and gtk4-broadwayd then tends to abort too). Broadway only
-delivers a click where the pointer last moved: move before pressing.
+delivers a click where the pointer last moved: move before pressing. gtk4-broadwayd
+often aborts (`append_node_ops: assertion failed: (!reused_node->consumed)`) a few
+redraws after a list rebuild or a text change made from code; relaunch, and check
+what a change did with the server rather than the screen.

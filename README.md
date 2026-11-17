@@ -34,8 +34,16 @@ Omarchy theme live.
   one from the terminal.
 - Two-step login with an authenticator app, an emailed code or a YubiKey
   (OTP), and "remember this device".
-
-Vord is read-only for now; editing is next on the [roadmap](#roadmap).
+- Creating and editing every item type, in your own vault or an
+  organization's collections: websites, custom fields, notes, folder,
+  favorite and re-prompt. A new SSH key item gets a freshly made Ed25519 key.
+- A changed password goes into the item's password history (the last five,
+  shown under the item), as do a hidden field's old values.
+- Cloning, moving to the Trash, restoring and deleting for good; creating,
+  renaming and deleting folders.
+- Saving changes only what you changed. Passkeys, attachments and anything
+  Vord doesn't show yet are kept as they are, and a save made over a copy
+  that changed elsewhere is refused rather than overwriting it.
 
 ## Roadmap
 
@@ -43,11 +51,10 @@ The aim is to do what the Bitwarden desktop app does, in this order:
 
 1. ~~Two-step login with an authenticator app, email or a YubiKey.~~ Done.
 2. ~~Password, passphrase and username generator.~~ Done.
-3. Creating and editing items: every item type, folders, favorites, moving
-   items between folders and organizations, cloning, deleting to the Trash
-   and restoring from it, and each item's password history. Fields Vord
-   doesn't show yet (passkeys, attachments, anything newer) are kept as they
-   are when an item is saved.
+3. Creating and editing items. Done: every item type, folders, favorites,
+   cloning, the Trash, password history. Still to do: moving an item from
+   your own vault into an organization, and changing an existing item's
+   collections.
 4. Attachments: downloading and uploading them.
 5. Sends: sharing text and files by link.
 6. Unlocking with a PIN, exporting the vault, syncing the moment something
@@ -58,8 +65,8 @@ The aim is to do what the Bitwarden desktop app does, in this order:
 
 Until then:
 
-- Edit items in the web vault or another Bitwarden app; Vord picks the change
-  up on its next sync.
+- Move an item into an organization, or change its collections, in the web
+  vault or another Bitwarden app; Vord picks the change up on its next sync.
 - Attachments are listed by name but can't be opened.
 - An account whose only second step is Duo or a FIDO2 key gets a clear error
   at login; one that also has an authenticator app or email can use those.
@@ -74,6 +81,9 @@ with Vord.
 | Key | Action |
 | --- | --- |
 | Ctrl+F | Search |
+| Ctrl+N | New login (the + button has the other types) |
+| Ctrl+E | Edit the item |
+| Ctrl+S | Save the item being edited |
 | Ctrl+G | Generator |
 | Ctrl+U | Copy the username |
 | Ctrl+P | Copy the password |
@@ -102,12 +112,17 @@ Vord follows the Bitwarden client protocol and does all decryption locally:
   this device", the server's token for skipping two-step login. Like the
   official apps, Vord keeps it when you log out; delete the file to forget
   the device.
+- Changes are encrypted on your machine, with the item's own key when it has
+  one, before they're sent. Fields you didn't change keep their ciphertext.
+  Websites carry the checksum Bitwarden's apps use to notice a URI swapped
+  by a server.
 - Keys are zeroed when the vault locks, and every widget that showed
-  decrypted text is destroyed.
+  decrypted text is destroyed, including an editor with unsaved changes.
 
 The crypto is checked against values computed independently with Node's
 `crypto` module (`tests/vectors.js`) and the RFC 6238 TOTP vectors, and
-end to end against a real Vaultwarden (`tests/seed.js`).
+end to end against a real Vaultwarden (`tests/seed.js`). Items Vord saves
+are checked to open in Bitwarden's own web vault.
 
 ## Install
 

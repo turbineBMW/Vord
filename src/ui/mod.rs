@@ -12,12 +12,14 @@
 //! the vault was locked again is dropped (see [`Ui::epoch`]).
 
 mod detail;
+mod editor;
 mod generator;
 mod pages;
 mod prefs;
 mod vault;
 
 use crate::crypto::SymmetricKey;
+use crate::edit;
 use crate::session;
 use crate::settings;
 use crate::store::{self, Account};
@@ -68,6 +70,9 @@ pub struct Ui {
     reprompt_passed: RefCell<Option<String>>,
     /// The generator dialog, while it's open.
     generator: RefCell<Option<adw::Dialog>>,
+    /// Other dialogs over an unlocked vault (confirmations, folder
+    /// names); locking closes them.
+    dialogs: RefCell<Vec<glib::WeakRef<adw::Dialog>>>,
 }
 
 pub fn build(app: &adw::Application) -> Rc<Ui> {
@@ -113,6 +118,7 @@ pub fn build(app: &adw::Application) -> Rc<Ui> {
         sync_timer: RefCell::new(None),
         reprompt_passed: RefCell::new(None),
         generator: RefCell::new(None),
+        dialogs: RefCell::new(Vec::new()),
     });
     ui.login.connect(&ui);
     ui.two_factor.connect(&ui);
@@ -168,6 +174,18 @@ impl Ui {
             "sync",
             "generator",
             "search",
+            "edit-item",
+            "clone-item",
+            "favorite",
+            "trash-item",
+            "restore-item",
+            "purge-item",
+            "new-item",
+            "new-folder",
+            "rename-folder",
+            "delete-folder",
+            "save-item",
+            "cancel-edit",
             "copy-username",
             "copy-password",
             "copy-totp",
@@ -515,6 +533,11 @@ impl Ui {
         if let Some(dialog) = self.generator.take() {
             dialog.force_close();
         }
+        for dialog in self.dialogs.take() {
+            if let Some(dialog) = dialog.upgrade() {
+                dialog.force_close();
+            }
+        }
         self.session.replace(None);
         UNLOCKED.with(|u| u.set(false));
         self.reprompt_passed.replace(None);
@@ -625,6 +648,390 @@ impl Ui {
         self.reprompt_passed.replace(None);
     }
 
+    // ---- changing the vault ---------------------------------------------
+
+    /// Show a dialog over the vault; locking closes it.
+    fn present_dialog(&self, dialog: &impl IsA<adw::Dialog>) {
+        let mut dialogs = self.dialogs.borrow_mut();
+        dialogs.retain(|d| d.upgrade().is_some());
+        dialogs.push(dialog.upcast_ref::<adw::Dialog>().downgrade());
+        dialog.present(Some(&self.window));
+    }
+
+    /// Ask before doing something; `then` runs on yes.
+    fn confirm(
+        self: &Rc<Self>,
+        heading: &str,
+        body: &str,
+        yes: &str,
+        then: impl Fn(&Rc<Ui>) + 'static,
+    ) {
+        let dialog = adw::AlertDialog::new(Some(heading), Some(body));
+        dialog.add_responses(&[("cancel", "_Cancel"), ("yes", yes)]);
+        dialog.set_response_appearance("yes", adw::ResponseAppearance::Destructive);
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
+        let ui = Rc::downgrade(self);
+        let epoch = self.epoch.get();
+        dialog.connect_response(Some("yes"), move |_, _| {
+            if let Some(ui) = ui.upgrade().filter(|ui| ui.epoch.get() == epoch) {
+                then(&ui);
+            }
+        });
+        self.present_dialog(&dialog);
+    }
+
+    /// The selected item, opened for editing: its draft, raw copy and key.
+    fn open_selected(&self) -> Option<(String, edit::Draft, serde_json::Value, SymmetricKey)> {
+        let id = self.vault.selected_id()?;
+        let vault = self.vault.current_vault()?;
+        let raw = vault.raw(&id)?.clone();
+        let session = self.session.borrow();
+        let keys = &session.as_ref()?.keys;
+        let opened =
+            edit::item_key(&raw, keys).and_then(|key| Ok((edit::Draft::open(&raw, &key)?, key)));
+        match opened {
+            Ok((draft, key)) => Some((id, draft, raw, key)),
+            Err(error) => {
+                log::warn!("cannot open item {id} for editing: {error}");
+                self.toast("This item can't be edited: part of it won't decrypt.");
+                None
+            }
+        }
+    }
+
+    /// Run `then` now, or once the master password is re-entered when the
+    /// selected item asks for it.
+    fn with_selected_unlocked(self: &Rc<Self>, then: fn(&Rc<Ui>)) {
+        let Some(id) = self.vault.selected_id() else {
+            return;
+        };
+        let reprompt = self
+            .vault
+            .current_vault()
+            .and_then(|v| v.item(&id).map(|i| i.reprompt))
+            .unwrap_or(false);
+        if reprompt {
+            let ui = Rc::downgrade(self);
+            self.reprompt(&id, move || {
+                if let Some(ui) = ui.upgrade() {
+                    then(&ui);
+                }
+            });
+        } else {
+            then(self);
+        }
+    }
+
+    fn start_edit(self: &Rc<Self>) {
+        self.with_selected_unlocked(|ui| {
+            let Some((id, draft, _, _)) = ui.open_selected() else {
+                return;
+            };
+            let Some(vault) = ui.vault.current_vault() else {
+                return;
+            };
+            let editor = editor::Editor::new(&vault, &draft, Some(id), Some(draft.clone()));
+            ui.vault.show_editor(ui, editor);
+        });
+    }
+
+    fn start_clone(self: &Rc<Self>) {
+        self.with_selected_unlocked(|ui| {
+            let Some((_, draft, _, _)) = ui.open_selected() else {
+                return;
+            };
+            let Some(vault) = ui.vault.current_vault() else {
+                return;
+            };
+            let editor = editor::Editor::new(&vault, &draft.cloned(), None, None);
+            ui.vault.show_editor(ui, editor);
+        });
+    }
+
+    fn start_new(self: &Rc<Self>, kind: crate::vault::Kind) {
+        if !self.is_unlocked() || self.vault.editor().is_some() {
+            return;
+        }
+        let Some(vault) = self.vault.current_vault() else {
+            return;
+        };
+        let mut draft = editor::starting_draft(kind, &self.vault.current_filter(), &vault);
+        if kind == crate::vault::Kind::SshKey {
+            if let Err(error) = edit::new_ssh_key(&mut draft) {
+                log::warn!("could not make an SSH key: {error}");
+                return self.toast("Could not make a new SSH key.");
+            }
+        }
+        let editor = editor::Editor::new(&vault, &draft, None, None);
+        self.vault.show_editor(self, editor);
+    }
+
+    fn save_edit(self: &Rc<Self>) {
+        let Some(editor) = self.vault.editor() else {
+            return;
+        };
+        let draft = editor.draft();
+        if let Some(problem) = draft.problem() {
+            return self.toast(problem);
+        }
+        let body = {
+            let session = self.session.borrow();
+            let Some(keys) = session.as_ref().map(|s| &s.keys) else {
+                return;
+            };
+            let vault = self.vault.current_vault();
+            let now = session::now_iso();
+            let saver = edit::Saver {
+                user_id: vault.as_ref().and_then(|v| v.user_id.as_deref()),
+                now: &now,
+            };
+            match (&editor.id, &editor.original) {
+                (Some(id), Some(original)) => {
+                    let Some(raw) = vault.as_ref().and_then(|v| v.raw(id)) else {
+                        return self.toast("This item is no longer in the vault.");
+                    };
+                    let key = match edit::item_key(raw, keys) {
+                        Ok(key) => key,
+                        Err(error) => {
+                            log::warn!("cannot save item {id}: {error}");
+                            return self.toast("This item can't be saved: its key won't open.");
+                        }
+                    };
+                    let base = edit::Base { raw, original };
+                    edit::request(&draft, Some(base), &key, &saver)
+                }
+                _ => {
+                    let Some(key) = keys.for_org(draft.org_id.as_deref()) else {
+                        return self.toast("Vord has no key for that organization.");
+                    };
+                    edit::request(&draft, None, key, &saver)
+                }
+            }
+        };
+        let change = session::Change::SaveItem {
+            id: editor.id.clone(),
+            body,
+            collections: draft.collection_ids.clone(),
+        };
+        self.vault.set_saving(true);
+        let message = if editor.id.is_some() {
+            "Item saved"
+        } else {
+            "Item added"
+        };
+        self.run_change(change, message, |ui, touched| {
+            ui.vault.end_edit(ui);
+            match touched {
+                session::Touched::Item(id) => Some(Some(id)),
+                _ => None,
+            }
+        });
+    }
+
+    fn toggle_favorite(self: &Rc<Self>) {
+        let Some(id) = self.vault.selected_id() else {
+            return;
+        };
+        let Some(item) = self
+            .vault
+            .current_vault()
+            .and_then(|v| v.item(&id).cloned())
+        else {
+            return;
+        };
+        let change = session::Change::Favorite {
+            id,
+            folder_id: item.folder_id.clone(),
+            favorite: !item.favorite,
+        };
+        let message = if item.favorite {
+            "Removed from favorites"
+        } else {
+            "Added to favorites"
+        };
+        self.run_change(change, message, |_, _| None);
+    }
+
+    fn trash_item(self: &Rc<Self>) {
+        let Some(id) = self.vault.selected_id() else {
+            return;
+        };
+        self.confirm(
+            "Move to Trash?",
+            "You can restore it from the Trash.",
+            "_Move to Trash",
+            move |ui| {
+                let change = session::Change::Trash(id.clone());
+                ui.run_change(change, "Moved to the Trash", |_, _| Some(None));
+            },
+        );
+    }
+
+    fn restore_item(self: &Rc<Self>) {
+        let Some(id) = self.vault.selected_id() else {
+            return;
+        };
+        self.run_change(session::Change::Restore(id), "Item restored", |_, _| {
+            Some(None)
+        });
+    }
+
+    fn purge_item(self: &Rc<Self>) {
+        let Some(id) = self.vault.selected_id() else {
+            return;
+        };
+        self.confirm(
+            "Delete Permanently?",
+            "The item and its attachments are deleted for good. This can't be undone.",
+            "_Delete Permanently",
+            move |ui| {
+                let change = session::Change::Purge(id.clone());
+                ui.run_change(change, "Item deleted", |_, _| Some(None));
+            },
+        );
+    }
+
+    /// Ask for a folder's name: a new folder, or a new name for `id`.
+    fn folder_name_dialog(self: &Rc<Self>, folder: Option<(String, String)>) {
+        if !self.is_unlocked() {
+            return;
+        }
+        let entry = gtk::Entry::builder()
+            .activates_default(true)
+            .placeholder_text("Name")
+            .text(folder.as_ref().map_or("", |(_, name)| name.as_str()))
+            .build();
+        let (heading, yes) = match folder {
+            Some(_) => ("Rename Folder", "_Rename"),
+            None => ("New Folder", "_Create"),
+        };
+        let dialog = adw::AlertDialog::new(Some(heading), None);
+        dialog.set_extra_child(Some(&entry));
+        dialog.add_responses(&[("cancel", "_Cancel"), ("yes", yes)]);
+        dialog.set_response_appearance("yes", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("yes"));
+        dialog.set_close_response("cancel");
+        let ui = Rc::downgrade(self);
+        let epoch = self.epoch.get();
+        let typed = entry.clone();
+        dialog.connect_response(Some("yes"), move |_, _| {
+            let Some(ui) = ui.upgrade().filter(|ui| ui.epoch.get() == epoch) else {
+                return;
+            };
+            let name = typed.text().trim().to_string();
+            if name.is_empty() {
+                return;
+            }
+            let Some(sealed) = ui
+                .session
+                .borrow()
+                .as_ref()
+                .map(|s| s.keys.user.encrypt_text(&name))
+            else {
+                return;
+            };
+            let id = folder.as_ref().map(|(id, _)| id.clone());
+            let message = if id.is_some() {
+                "Folder renamed"
+            } else {
+                "Folder created"
+            };
+            let change = session::Change::SaveFolder { id, name: sealed };
+            ui.run_change(change, message, |_, _| None);
+        });
+        self.present_dialog(&dialog);
+        entry.grab_focus();
+    }
+
+    fn current_folder(&self) -> Option<(String, String)> {
+        let vault::Filter::Folder(Some(id)) = self.vault.current_filter() else {
+            return None;
+        };
+        let vault = self.vault.current_vault()?;
+        let folder = vault.folders.iter().find(|f| f.id == id)?;
+        Some((folder.id.clone(), folder.name.clone()))
+    }
+
+    fn rename_folder(self: &Rc<Self>) {
+        if let Some(folder) = self.current_folder() {
+            self.folder_name_dialog(Some(folder));
+        }
+    }
+
+    fn delete_folder(self: &Rc<Self>) {
+        let Some((id, _)) = self.current_folder() else {
+            return;
+        };
+        self.confirm(
+            "Delete Folder?",
+            "Its items stay in the vault, in No Folder.",
+            "_Delete",
+            move |ui| {
+                let change = session::Change::DeleteFolder(id.clone());
+                ui.run_change(change, "Folder deleted", |_, _| None);
+            },
+        );
+    }
+
+    /// Send a change on a worker; on success show the vault as it now is
+    /// and say `done`. `after` runs first and may pick the item to select
+    /// (`Some(None)` selects nothing; `None` keeps the selection).
+    fn run_change(
+        self: &Rc<Self>,
+        change: session::Change,
+        done: &'static str,
+        after: impl Fn(&Rc<Ui>, session::Touched) -> Option<Option<String>> + 'static,
+    ) {
+        let Some(account) = self.account.borrow().clone() else {
+            return;
+        };
+        let Some(user_key) = self.session.borrow().as_ref().map(|s| s.keys.user.clone()) else {
+            return;
+        };
+        let epoch = self.epoch.get();
+        let ui = self.clone();
+        glib::spawn_future_local(async move {
+            let result = gio::spawn_blocking(move || {
+                let (account, sync, touched) = session::change(account, change)?;
+                let unlocked = session::open_sync(&account, user_key, &sync);
+                Ok::<_, session::Error>((account, unlocked, touched))
+            })
+            .await
+            .unwrap_or_else(|_| Err(session::Error::Other("Saving crashed.".into())));
+            ui.vault.set_saving(false);
+            if ui.epoch.get() != epoch || !ui.is_unlocked() {
+                if let Ok((account, ..)) = result {
+                    ui.account.replace(Some(account));
+                }
+                return;
+            }
+            match result {
+                Ok((account, unlocked, touched)) => {
+                    ui.account.replace(Some(account));
+                    if let Some(session) = ui.session.borrow_mut().as_mut() {
+                        session.keys = unlocked.keys;
+                    }
+                    let vault = Rc::new(unlocked.vault);
+                    if let Some(select) = after(&ui, touched) {
+                        ui.vault.select(&vault, select);
+                    }
+                    ui.vault.show_vault(&ui, vault, false);
+                    ui.toast(done);
+                }
+                Err(session::Error::Api(crate::api::ApiError::SessionExpired)) => {
+                    ui.toast(
+                        "The server ended this session. Log out and in again to make changes.",
+                    );
+                }
+                Err(error) => {
+                    log::warn!("a change failed: {error}");
+                    ui.toast(&error.to_string());
+                }
+            }
+        });
+    }
+
     // ---- lock when left alone -----------------------------------------
 
     fn watch_focus(self: &Rc<Self>) {
@@ -685,6 +1092,43 @@ impl Ui {
             ui.vault.copy_field(ui, vault::Quick::Website)
         });
         action("generator", &["<Control>g"], generator::show);
+        action("edit-item", &["<Control>e"], |ui| ui.start_edit());
+        action("clone-item", &[], |ui| ui.start_clone());
+        action("save-item", &["<Control>s"], |ui| ui.save_edit());
+        action("cancel-edit", &[], |ui| ui.vault.end_edit(ui));
+        action("trash-item", &[], |ui| ui.trash_item());
+        action("restore-item", &[], |ui| ui.restore_item());
+        action("purge-item", &[], |ui| ui.purge_item());
+        action("new-folder", &[], |ui| ui.folder_name_dialog(None));
+        action("rename-folder", &[], |ui| ui.rename_folder());
+        action("delete-folder", &[], |ui| ui.delete_folder());
+        {
+            let favorite = gio::SimpleAction::new_stateful("favorite", None, &false.to_variant());
+            let weak = Rc::downgrade(self);
+            favorite.connect_activate(move |_, _| {
+                if let Some(ui) = weak.upgrade() {
+                    ui.toggle_favorite();
+                }
+            });
+            self.window.add_action(&favorite);
+            let new_item = gio::SimpleAction::new("new-item", Some(glib::VariantTy::STRING));
+            let weak = Rc::downgrade(self);
+            new_item.connect_activate(move |_, kind| {
+                let (Some(ui), Some(kind)) = (weak.upgrade(), kind.and_then(|k| k.str())) else {
+                    return;
+                };
+                let kind = match kind {
+                    "card" => crate::vault::Kind::Card,
+                    "identity" => crate::vault::Kind::Identity,
+                    "note" => crate::vault::Kind::Note,
+                    "ssh-key" => crate::vault::Kind::SshKey,
+                    _ => crate::vault::Kind::Login,
+                };
+                ui.start_new(kind);
+            });
+            self.window.add_action(&new_item);
+            app.set_accels_for_action("win.new-item::login", &["<Control>n"]);
+        }
         action("logout", &[], |ui| ui.confirm_logout());
         action("preferences", &["<Control>comma"], prefs::show);
         action("about", &[], |ui| ui.show_about());
@@ -719,6 +1163,8 @@ fn empty_vault() -> Vault {
         collections: Vec::new(),
         items: Vec::new(),
         damaged: 0,
+        raw: Default::default(),
+        user_id: None,
     }
 }
 

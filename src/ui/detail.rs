@@ -100,9 +100,12 @@ impl Builder<'_> {
 
     /// A hidden value: masked until revealed, copyable.
     fn secret_row(&self, group: &adw::PreferencesGroup, title: &str, value: &str, copy_what: &str) {
-        if value.is_empty() {
-            return;
+        if !value.is_empty() {
+            group.add(&self.secret(title, value, copy_what));
         }
+    }
+
+    fn secret(&self, title: &str, value: &str, copy_what: &str) -> adw::ActionRow {
         let row = adw::ActionRow::builder()
             .title(title)
             .subtitle(MASK)
@@ -165,7 +168,7 @@ impl Builder<'_> {
         copy.connect_clicked(move |_| copy_action());
         row.add_suffix(&reveal);
         row.add_suffix(&copy);
-        group.add(&row);
+        row
     }
 
     fn totp_row(&self, group: &adw::PreferencesGroup, totp: Totp) {
@@ -593,12 +596,25 @@ pub fn build(ui: &Rc<Ui>, vault: &Vault, item: &Item) -> gtk::Widget {
     {
         history.push(format!("Password changed {changed}"));
     }
-    if item.password_history > 0 {
-        history.push(format!(
-            "{} earlier password{}",
-            item.password_history,
-            if item.password_history == 1 { "" } else { "s" }
-        ));
+    if !item.password_history.is_empty() {
+        let group = b.group("");
+        let count = item.password_history.len();
+        let expander = adw::ExpanderRow::builder()
+            .title("Password history")
+            .subtitle(format!(
+                "{count} earlier password{}",
+                if count == 1 { "" } else { "s" }
+            ))
+            .build();
+        for past in &item.password_history {
+            let title = past
+                .until
+                .as_deref()
+                .and_then(when)
+                .map_or("Earlier".to_string(), |w| format!("Until {w}"));
+            expander.add_row(&b.secret(&title, &past.password, "password"));
+        }
+        group.add(&expander);
     }
     if !history.is_empty() {
         column.append(

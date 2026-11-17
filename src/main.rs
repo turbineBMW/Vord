@@ -2,6 +2,7 @@ mod accent;
 mod api;
 mod clipboard;
 mod crypto;
+mod edit;
 mod generator;
 mod icons;
 mod omarchy;
