@@ -119,6 +119,7 @@ pub fn show(ui: &Rc<Ui>) {
     if ui.is_unlocked() {
         page.add(&pin_group(ui, &dialog));
     }
+    page.add(&tray_group(ui, &current));
     page.add(&agent_group(ui, &current));
 
     if let Some(account) = ui.account.borrow().as_ref() {
@@ -159,6 +160,43 @@ pub fn show(ui: &Rc<Ui>) {
         page.add(&group);
     }
     dialog.present(Some(&ui.window));
+}
+
+/// The tray icon, and whether closing the window leaves Vord in it.
+fn tray_group(ui: &Rc<Ui>, current: &settings::Settings) -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::builder().title("Tray").build();
+    let on = adw::SwitchRow::builder()
+        .title("Show in the tray")
+        .subtitle("An icon to show, hide or lock Vord")
+        .active(current.tray)
+        .build();
+    let weak = Rc::downgrade(ui);
+    on.connect_active_notify(move |row| {
+        let on = row.is_active();
+        settings::update(|s| s.tray = on);
+        if let Some(ui) = weak.upgrade() {
+            if on {
+                ui.start_tray();
+            } else {
+                ui.stop_tray();
+            }
+        }
+    });
+    group.add(&on);
+    let close = adw::SwitchRow::builder()
+        .title("Close to the tray")
+        .subtitle("Closing the window keeps Vord running; quit from the tray or with Ctrl+Q")
+        .active(current.close_to_tray)
+        .build();
+    close.connect_active_notify(|row| {
+        let on = row.is_active();
+        settings::update(|s| s.close_to_tray = on);
+    });
+    on.bind_property("active", &close, "sensitive")
+        .sync_create()
+        .build();
+    group.add(&close);
+    group
 }
 
 /// The SSH agent: on or off, where it listens, when it asks.

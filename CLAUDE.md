@@ -55,6 +55,8 @@ src/totp.rs      otpauth://, steam://, bare base32; RFC 6238 vectors in the test
 src/clipboard.rs secret copies carry x-kde-passwordManagerHint=secret; auto-clear
 src/live.rs      live sync: the notifications hub (SignalR, MessagePack over a
                  websocket) on a thread of its own; a change by another device syncs
+src/tray.rs      the tray icon (ksni, a StatusNotifierItem on its own thread);
+                 commands reach the window through the main loop
 src/icons.rs     /icons/<host>/icon.png from the user's own server, cached in ~/.cache/vord
 src/screenlock.rs logind Lock + PrepareForSleep; Omarchy's shell lock is invisible to
                  logind, so `omarchy-hyprland-session-locked` is polled while unlocked and

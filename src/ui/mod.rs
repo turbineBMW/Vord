@@ -37,8 +37,9 @@ use std::time::Duration;
 thread_local! {
     /// Mirrors [`Ui::is_unlocked`] for code outside the window.
     pub static UNLOCKED: Cell<bool> = const { Cell::new(false) };
-    /// The window, for the live-sync thread's events to find.
-    static LIVE_UI: RefCell<std::rc::Weak<Ui>> = const { RefCell::new(std::rc::Weak::new()) };
+    /// The window, for other threads' events (live sync, the SSH agent,
+    /// the tray) to find on the main loop.
+    static THE_UI: RefCell<std::rc::Weak<Ui>> = const { RefCell::new(std::rc::Weak::new()) };
 }
 
 /// What the live-sync thread reports.
@@ -113,6 +114,8 @@ pub struct Ui {
     agent_allowed: RefCell<std::collections::HashSet<String>>,
     /// Requests to sign that wait for the vault to be unlocked.
     agent_waiting: RefCell<Vec<agent::Waiting>>,
+    /// The tray icon, while it's shown.
+    tray: RefCell<Option<ksni::blocking::Handle<crate::tray::Tray>>>,
 }
 
 /// Wrong PINs allowed before the master password is needed.
@@ -174,8 +177,9 @@ pub fn build(app: &adw::Application) -> Rc<Ui> {
         agent_keys: RefCell::new(Vec::new()),
         agent_allowed: RefCell::new(Default::default()),
         agent_waiting: RefCell::new(Vec::new()),
+        tray: RefCell::new(None),
     });
-    LIVE_UI.with(|w| w.replace(Rc::downgrade(&ui)));
+    THE_UI.with(|w| w.replace(Rc::downgrade(&ui)));
     ui.login.connect(&ui);
     ui.two_factor.connect(&ui);
     ui.unlock.connect(&ui);
@@ -183,6 +187,20 @@ pub fn build(app: &adw::Application) -> Rc<Ui> {
     ui.add_actions(app);
     ui.watch_focus();
     agent::start(&ui);
+    ui.start_tray();
+    // With the tray icon, closing the window hides it; the vault locks
+    // as it would in the background.
+    let weak = Rc::downgrade(&ui);
+    ui.window.connect_close_request(move |window| {
+        let to_tray = weak.upgrade().is_some_and(|ui| ui.tray.borrow().is_some())
+            && settings::get().close_to_tray;
+        if to_tray {
+            window.set_visible(false);
+            glib::Propagation::Stop
+        } else {
+            glib::Propagation::Proceed
+        }
+    });
     crate::sidebar::sync(&ui.window);
     {
         let weak = Rc::downgrade(&ui);
@@ -674,6 +692,7 @@ impl Ui {
         self.live_failures.set(0);
         self.start_live();
         agent::unlocked(self);
+        self.update_tray();
         let weak = Rc::downgrade(self);
         let timer = glib::timeout_add_local(AUTO_SYNC, move || match weak.upgrade() {
             Some(ui) if ui.is_unlocked() => {
@@ -795,6 +814,7 @@ impl Ui {
         self.unlock
             .set_pin_available(self.pin_sealed.borrow().is_some());
         self.show_page("unlock");
+        self.update_tray();
     }
 
     fn confirm_logout(self: &Rc<Self>) {
@@ -1714,6 +1734,66 @@ impl Ui {
         }
     }
 
+    // ---- the tray icon -------------------------------------------------
+
+    pub fn start_tray(self: &Rc<Self>) {
+        use ksni::blocking::TrayMethods;
+        if !settings::get().tray || self.tray.borrow().is_some() {
+            return;
+        }
+        let mut tray = crate::tray::Tray::new(|command| {
+            glib::idle_add_once(move || {
+                if let Some(ui) = THE_UI.with(|w| w.borrow().upgrade()) {
+                    ui.on_tray(command);
+                }
+            });
+        });
+        tray.unlocked = self.is_unlocked();
+        match tray.spawn() {
+            Ok(handle) => {
+                self.tray.replace(Some(handle));
+            }
+            Err(error) => {
+                log::warn!("no tray icon: {error}");
+                self.toast(
+                    "The tray icon couldn't be shown: nothing on the desktop shows tray icons.",
+                );
+            }
+        }
+    }
+
+    pub fn stop_tray(&self) {
+        if let Some(handle) = self.tray.take() {
+            // Don't wait for it to go: the main loop must keep running.
+            drop(handle.shutdown());
+        }
+        // A hidden window can't come back without the icon.
+        self.window.present();
+    }
+
+    fn update_tray(&self) {
+        let unlocked = self.is_unlocked();
+        if let Some(handle) = self.tray.borrow().as_ref() {
+            handle.update(|tray| tray.unlocked = unlocked);
+        }
+    }
+
+    fn on_tray(self: &Rc<Self>, command: crate::tray::Command) {
+        use crate::tray::Command;
+        match command {
+            Command::Toggle if self.window.is_visible() && self.window.is_active() => {
+                self.window.set_visible(false);
+            }
+            Command::Toggle | Command::Show => self.window.present(),
+            Command::Lock => self.lock(),
+            Command::Quit => {
+                if let Some(app) = self.window.application() {
+                    app.quit();
+                }
+            }
+        }
+    }
+
     // ---- lock when left alone -----------------------------------------
 
     fn watch_focus(self: &Rc<Self>) {
@@ -1849,7 +1929,7 @@ impl Ui {
 
 /// An event from the live-sync thread, delivered on the main loop.
 fn live_news(id: u64, news: LiveNews) {
-    if let Some(ui) = LIVE_UI.with(|w| w.borrow().upgrade()) {
+    if let Some(ui) = THE_UI.with(|w| w.borrow().upgrade()) {
         ui.on_live(id, news);
     }
 }
