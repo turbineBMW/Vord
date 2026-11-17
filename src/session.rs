@@ -18,6 +18,7 @@ fn now() -> u64 {
 #[derive(Debug)]
 pub enum Error {
     WrongPassword,
+    WrongPin,
     Api(ApiError),
     Crypto(CryptoError),
     Other(String),
@@ -27,6 +28,7 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::WrongPassword => f.write_str("Wrong master password."),
+            Self::WrongPin => f.write_str("Wrong PIN."),
             Self::Api(error) => error.fmt(f),
             Self::Crypto(error) => write!(f, "Could not open the vault: {error}"),
             Self::Other(why) => f.write_str(why),
@@ -62,6 +64,55 @@ pub fn unlock_key(account: &Account, password: &str) -> Result<SymmetricKey, Err
             CryptoError::Mac | CryptoError::Decrypt => Error::WrongPassword,
             other => Error::Crypto(other),
         })
+}
+
+/// The key a PIN makes, as Bitwarden's apps make it: the account's KDF over
+/// the PIN, salted with the email, stretched as a master key is.
+fn pin_key(account: &Account, pin: &str) -> Result<SymmetricKey, Error> {
+    Ok(MasterKey::derive(pin, &account.email, account.kdf)?.stretch())
+}
+
+/// Seal the user key with a PIN's key, for unlocking with the PIN.
+pub fn seal_with_pin(
+    account: &Account,
+    pin: &str,
+    user_key: &SymmetricKey,
+) -> Result<String, Error> {
+    Ok(pin_key(account, pin)?
+        .encrypt(&user_key.to_bytes())
+        .to_string())
+}
+
+/// After the master password: seal the user key again with the PIN kept
+/// (encrypted with the user key) in `encrypted_pin`.
+pub fn reseal_with_pin(
+    account: &Account,
+    encrypted_pin: &str,
+    user_key: &SymmetricKey,
+) -> Result<String, Error> {
+    let pin = Zeroizing::new(encrypted_pin.parse::<EncString>()?.decrypt_text(user_key)?);
+    seal_with_pin(account, &pin, user_key)
+}
+
+/// Open the user key with a PIN. A sealed key that opens but no longer
+/// fits the account (its key was rotated elsewhere) is refused.
+pub fn unlock_with_pin(account: &Account, sealed: &str, pin: &str) -> Result<SymmetricKey, Error> {
+    let bytes = sealed
+        .parse::<EncString>()?
+        .decrypt(&pin_key(account, pin)?)
+        .map_err(|error| match error {
+            CryptoError::Mac | CryptoError::Decrypt => Error::WrongPin,
+            other => Error::Crypto(other),
+        })?;
+    let user_key = SymmetricKey::from_bytes(&bytes)?;
+    if let Some(private) = &account.private_key {
+        if private.parse::<EncString>()?.decrypt(&user_key).is_err() {
+            return Err(Error::Other(
+                "The PIN no longer opens this vault. Unlock with the master password.".into(),
+            ));
+        }
+    }
+    Ok(user_key)
 }
 
 /// Open the cached vault with a user key. `None` when there is no cache yet.
@@ -1215,5 +1266,54 @@ mod live {
         assert_eq!(ids(&sync, "ciphers"), ids(&fresh, "ciphers"));
         assert_eq!(ids(&sync, "folders"), ids(&fresh, "folders"));
         assert_eq!(ids(&sync, "sends"), ids(&fresh, "sends"));
+    }
+}
+
+#[cfg(test)]
+mod pin_tests {
+    use super::*;
+
+    fn account(user_key: &SymmetricKey) -> Account {
+        Account {
+            server: "https://vw.example.org".into(),
+            email: "Me@Example.org".into(),
+            kdf: Kdf::Pbkdf2 { iterations: 1000 },
+            device_id: "d".into(),
+            refresh_token: None,
+            access_token: None,
+            access_expires: 0,
+            user_key: String::new(),
+            private_key: Some(user_key.encrypt(b"a private key").to_string()),
+        }
+    }
+
+    #[test]
+    fn a_pin_opens_the_user_key_and_a_wrong_one_does_not() {
+        let user_key = SymmetricKey::generate();
+        let account = account(&user_key);
+        let sealed = seal_with_pin(&account, "2468", &user_key).unwrap();
+        let opened = unlock_with_pin(&account, &sealed, "2468").unwrap();
+        assert_eq!(*opened.to_bytes(), *user_key.to_bytes());
+        assert!(matches!(
+            unlock_with_pin(&account, &sealed, "1357"),
+            Err(Error::WrongPin)
+        ));
+
+        // After the master password, the PIN kept with the user key seals
+        // it again.
+        let encrypted_pin = user_key.encrypt_text("2468");
+        let resealed = reseal_with_pin(&account, &encrypted_pin, &user_key).unwrap();
+        assert!(unlock_with_pin(&account, &resealed, "2468").is_ok());
+
+        // A key rotated elsewhere: the old seal opens, but doesn't fit.
+        let rotated = SymmetricKey::generate();
+        let moved_on = Account {
+            private_key: Some(rotated.encrypt(b"a private key").to_string()),
+            ..account
+        };
+        assert!(matches!(
+            unlock_with_pin(&moved_on, &sealed, "2468"),
+            Err(Error::Other(_))
+        ));
     }
 }

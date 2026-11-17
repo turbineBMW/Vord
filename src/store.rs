@@ -10,6 +10,10 @@
 //!   the official apps' do: the server ties the token to the device id, and
 //!   a new id each login would read as a new device.
 //!
+//! - `pin.json`, when PIN unlock is on: the PIN encrypted with the user key
+//!   and, only if the user chose to keep PIN unlock across restarts, the
+//!   user key sealed with a key made from the PIN.
+//!
 //! Nothing decrypted is ever written. This is what the official desktop app
 //! keeps too, and it is what lets Vord unlock without the network.
 
@@ -232,8 +236,49 @@ pub fn update_vault(change: impl FnOnce(&mut serde_json::Value)) -> serde_json::
 
 /// Log out: forget the account and the cached vault. Settings, the icon
 /// cache and the device (see the module notes) stay.
+/// PIN unlock's state, kept apart from `account.json` so a sync saving the
+/// account can't undo a change to it.
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct PinState {
+    /// The PIN, encrypted with the user key: what turns PIN unlock back on
+    /// after the master password. Present while PIN unlock is on.
+    pub pin: Option<String>,
+    /// The user key sealed with the PIN's key, kept across restarts.
+    pub sealed: Option<String>,
+    /// Whether the user chose to keep it across restarts; `sealed` can be
+    /// gone meanwhile (too many wrong PINs) until the master password
+    /// seals it again.
+    #[serde(default)]
+    pub keep: bool,
+}
+
+pub fn load_pin() -> PinState {
+    fs::read(dir().join("pin.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_pin(state: &PinState) {
+    let path = dir().join("pin.json");
+    let result = if state.pin.is_none() && state.sealed.is_none() {
+        match fs::remove_file(&path) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+            _ => Ok(()),
+        }
+    } else {
+        write_private(
+            &path,
+            &serde_json::to_vec_pretty(state).expect("serialisable"),
+        )
+    };
+    if let Err(error) = result {
+        log::error!("could not save {}: {error}", path.display());
+    }
+}
+
 pub fn forget() {
-    for name in ["account.json", "vault.json"] {
+    for name in ["account.json", "vault.json", "pin.json"] {
         let path = dir().join(name);
         if let Err(error) = fs::remove_file(&path) {
             if error.kind() != std::io::ErrorKind::NotFound {

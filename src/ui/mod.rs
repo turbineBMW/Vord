@@ -75,7 +75,17 @@ pub struct Ui {
     /// Other dialogs over an unlocked vault (confirmations, folder
     /// names); locking closes them.
     dialogs: RefCell<Vec<glib::WeakRef<adw::Dialog>>>,
+    /// The user key sealed with the PIN's key, while PIN unlock can open
+    /// the vault. Kept in memory only, unless the user chose to keep it on
+    /// disk across restarts.
+    pin_sealed: RefCell<Option<String>>,
+    /// Wrong PINs since the last unlock; five turn PIN unlock off until the
+    /// master password is used.
+    pin_attempts: Cell<u8>,
 }
+
+/// Wrong PINs allowed before the master password is needed.
+const PIN_ATTEMPTS: u8 = 5;
 
 pub fn build(app: &adw::Application) -> Rc<Ui> {
     let window = adw::ApplicationWindow::builder()
@@ -121,6 +131,8 @@ pub fn build(app: &adw::Application) -> Rc<Ui> {
         reprompt_passed: RefCell::new(None),
         generator: RefCell::new(None),
         dialogs: RefCell::new(Vec::new()),
+        pin_sealed: RefCell::new(None),
+        pin_attempts: Cell::new(0),
     });
     ui.login.connect(&ui);
     ui.two_factor.connect(&ui);
@@ -155,6 +167,9 @@ impl Ui {
     fn start(self: &Rc<Self>) {
         match Account::load() {
             Some(account) => {
+                self.pin_sealed.replace(store::load_pin().sealed);
+                self.unlock
+                    .set_pin_available(self.pin_sealed.borrow().is_some());
                 self.unlock.show_account(&account);
                 self.account.replace(Some(account));
                 self.show_page("unlock");
@@ -193,6 +208,11 @@ impl Ui {
             "copy-password",
             "copy-totp",
             "open-website",
+            "export",
+            "new-send",
+            "copy-send-link",
+            "remove-send-password",
+            "delete-send",
         ] {
             self.set_action_enabled(action, vault);
         }
@@ -420,6 +440,10 @@ impl Ui {
             match result {
                 Ok((keys, vault)) => {
                     ui.unlock.clear_password();
+                    ui.pin_attempts.set(0);
+                    if ui.pin_sealed.borrow().is_none() {
+                        ui.rearm_pin(keys.user.clone());
+                    }
                     ui.opened(keys, vault);
                 }
                 Err(error) => {
@@ -430,6 +454,166 @@ impl Ui {
                 }
             }
         });
+    }
+
+    fn unlock_with_pin(self: &Rc<Self>, pin: String) {
+        let Some(account) = self.account.borrow().clone() else {
+            return;
+        };
+        let Some(sealed) = self.pin_sealed.borrow().clone() else {
+            return;
+        };
+        if pin.is_empty() {
+            return;
+        }
+        self.unlock.set_busy(true);
+        let ui = self.clone();
+        glib::spawn_future_local(async move {
+            let pin = zeroize::Zeroizing::new(pin);
+            let result = gio::spawn_blocking(move || {
+                let user_key = session::unlock_with_pin(&account, &sealed, &pin)?;
+                Ok::<_, session::Error>(session::open_cached(&account, user_key))
+            })
+            .await
+            .unwrap_or_else(|_| Err(session::Error::Other("Unlocking crashed.".into())));
+            ui.unlock.set_busy(false);
+            match result {
+                Ok((keys, vault)) => {
+                    ui.unlock.clear_password();
+                    ui.pin_attempts.set(0);
+                    ui.opened(keys, vault);
+                }
+                Err(session::Error::WrongPin) => {
+                    let tries = ui.pin_attempts.get() + 1;
+                    ui.pin_attempts.set(tries);
+                    if tries >= PIN_ATTEMPTS {
+                        ui.drop_pin_seal();
+                        ui.unlock.fail("Too many wrong PINs. Unlock with the master password; the PIN works again after that.");
+                    } else {
+                        ui.unlock.fail(&format!(
+                            "Wrong PIN. {} more tr{} before the master password is needed.",
+                            PIN_ATTEMPTS - tries,
+                            if PIN_ATTEMPTS - tries == 1 {
+                                "y"
+                            } else {
+                                "ies"
+                            }
+                        ));
+                    }
+                }
+                Err(error) => {
+                    log::warn!("PIN unlock failed: {error}");
+                    ui.drop_pin_seal();
+                    ui.unlock.fail(&error.to_string());
+                }
+            }
+        });
+    }
+
+    /// Stop the PIN opening the vault until the master password is used.
+    /// PIN unlock stays on.
+    fn drop_pin_seal(&self) {
+        self.pin_sealed.replace(None);
+        let mut state = store::load_pin();
+        if state.sealed.take().is_some() {
+            store::save_pin(&state);
+        }
+        self.unlock.set_pin_available(false);
+    }
+
+    /// After the master password: let the PIN open the vault again, when
+    /// PIN unlock is on.
+    fn rearm_pin(self: &Rc<Self>, user_key: SymmetricKey) {
+        let Some(encrypted_pin) = store::load_pin().pin else {
+            return;
+        };
+        let Some(account) = self.account.borrow().clone() else {
+            return;
+        };
+        let ui = self.clone();
+        glib::spawn_future_local(async move {
+            let sealed = gio::spawn_blocking(move || {
+                session::reseal_with_pin(&account, &encrypted_pin, &user_key)
+            })
+            .await
+            .unwrap_or_else(|_| Err(session::Error::Other("Sealing crashed.".into())));
+            match sealed {
+                // A PIN turned off meanwhile stays off.
+                Ok(sealed) if store::load_pin().pin.is_some() => {
+                    let mut state = store::load_pin();
+                    if state.keep {
+                        state.sealed = Some(sealed.clone());
+                        store::save_pin(&state);
+                    }
+                    ui.pin_sealed.replace(Some(sealed));
+                }
+                Ok(_) => {}
+                Err(error) => log::warn!("could not turn PIN unlock back on: {error}"),
+            }
+        });
+    }
+
+    /// Turn PIN unlock on with `pin`, kept across restarts if `keep`.
+    /// `done` hears whether it worked.
+    pub fn set_pin(self: &Rc<Self>, pin: String, keep: bool, done: impl Fn(bool) + 'static) {
+        let Some(account) = self.account.borrow().clone() else {
+            return done(false);
+        };
+        let Some(user_key) = self.session.borrow().as_ref().map(|s| s.keys.user.clone()) else {
+            return done(false);
+        };
+        let epoch = self.epoch.get();
+        let ui = self.clone();
+        glib::spawn_future_local(async move {
+            let pin = zeroize::Zeroizing::new(pin);
+            let result = gio::spawn_blocking(move || {
+                let sealed = session::seal_with_pin(&account, &pin, &user_key)?;
+                Ok::<_, session::Error>((sealed, user_key.encrypt_text(&pin)))
+            })
+            .await
+            .unwrap_or_else(|_| Err(session::Error::Other("Sealing crashed.".into())));
+            match result {
+                Ok((sealed, encrypted_pin)) if ui.epoch.get() == epoch => {
+                    store::save_pin(&store::PinState {
+                        pin: Some(encrypted_pin),
+                        sealed: keep.then(|| sealed.clone()),
+                        keep,
+                    });
+                    ui.pin_sealed.replace(Some(sealed));
+                    ui.pin_attempts.set(0);
+                    ui.unlock.set_pin_available(true);
+                    ui.toast("PIN unlock is on");
+                    done(true);
+                }
+                Ok(_) => done(false),
+                Err(error) => {
+                    log::warn!("could not set the PIN: {error}");
+                    ui.toast(&error.to_string());
+                    done(false);
+                }
+            }
+        });
+    }
+
+    pub fn clear_pin(&self) {
+        self.pin_sealed.replace(None);
+        store::save_pin(&store::PinState::default());
+        self.unlock.set_pin_available(false);
+    }
+
+    /// Keep PIN unlock across restarts (the sealed key on disk) or not.
+    pub fn keep_pin(&self, keep: bool) {
+        let mut state = store::load_pin();
+        if state.pin.is_none() {
+            return;
+        }
+        state.keep = keep;
+        state.sealed = if keep {
+            self.pin_sealed.borrow().clone()
+        } else {
+            None
+        };
+        store::save_pin(&state);
     }
 
     /// Unlocked: show what's cached at once, then sync.
@@ -550,6 +734,8 @@ impl Ui {
                 timer.remove();
             }
         }
+        self.unlock
+            .set_pin_available(self.pin_sealed.borrow().is_some());
         self.show_page("unlock");
     }
 
@@ -570,6 +756,9 @@ impl Ui {
     fn logout(self: &Rc<Self>) {
         self.lock();
         store::forget();
+        self.pin_sealed.replace(None);
+        self.pin_attempts.set(0);
+        self.unlock.set_pin_available(false);
         if let Some(account) = self.account.take() {
             self.login.prefill(&account.server, &account.email);
         }

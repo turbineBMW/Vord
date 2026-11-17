@@ -47,6 +47,9 @@ Omarchy theme live.
   expiry, a view limit and a password; hide your email or deactivate one.
   The link is copied when a Send is made; everything in it, file included,
   is encrypted before it leaves, and the key travels only in the link.
+- Unlocking with a PIN, as Bitwarden's apps do: after the master password
+  once per start, or across restarts if you choose. Five wrong PINs and
+  the master password is needed again.
 - Exporting the vault as Bitwarden's apps do: JSON, CSV, or JSON encrypted
   for this account or with a password of its own; Bitwarden and other
   password managers import them. `vord export` does it from the terminal.
@@ -67,7 +70,7 @@ The aim is to do what the Bitwarden desktop app does, in this order:
    and between its collections.~~ Done.
 4. ~~Attachments: downloading and uploading them.~~ Done.
 5. ~~Sends: sharing text and files by link.~~ Done.
-6. ~~Exporting the vault.~~ Done. Unlocking with a PIN, syncing the moment
+6. ~~Exporting the vault, unlocking with a PIN.~~ Done. Syncing the moment
    something changes on the server, an SSH agent for the vault's SSH keys,
    more than one account, and a tray icon.
 7. Two-step login with Duo or a FIDO2 security key, logging in by approving
@@ -130,6 +133,12 @@ Vord follows the Bitwarden client protocol and does all decryption locally:
   the server), so Vord copies links as secrets: they're hidden from
   clipboard history and cleared like a password. A Send's password goes to
   the server only as a PBKDF2 hash salted with that key.
+- With PIN unlock on, the user key is sealed with a key made from the PIN
+  (your account's own KDF, as for the master password) and held in memory,
+  so a restart asks for the master password. If you choose to keep it
+  across restarts, that seal is written to `pin.json`; a short PIN then
+  protects your vault from anyone who copies your files only as far as the
+  KDF slows them down.
 - Keys are zeroed when the vault locks, and every widget that showed
   decrypted text is destroyed, including an editor with unsaved changes.
 

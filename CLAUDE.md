@@ -34,6 +34,9 @@ src/session.rs   login (Done | SecondStep(PendingLogin)) / second_step / unlock_
                  attachments, Sends):
                  blocking, run on workers; `change` folds the answer into vault.json
 src/store.rs     account.json + vault.json (still encrypted) in $XDG_DATA_HOME/vord, 0600;
+                 pin.json (the PIN sealed by the user key, and the user key sealed by
+                 the PIN's key only if kept across restarts; apart from account.json,
+                 which a sync rewrites from an older copy);
                  device.json (device id + remember-2FA tokens) outlives logout; a
                  generation counter keeps a sync from overwriting a change made meanwhile
 src/vault.rs     the decrypted model; one bad item is marked `damaged`, never fatal;
