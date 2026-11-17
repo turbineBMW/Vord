@@ -13,6 +13,7 @@
 
 mod detail;
 mod editor;
+mod export;
 mod generator;
 mod pages;
 mod prefs;
@@ -1407,6 +1408,7 @@ impl Ui {
             ui.vault.copy_field(ui, vault::Quick::Website)
         });
         action("generator", &["<Control>g"], generator::show);
+        action("export", &[], export::show);
         action("edit-item", &["<Control>e"], |ui| ui.start_edit());
         action("clone-item", &[], |ui| ui.start_clone());
         action("add-attachment", &[], |ui| ui.add_attachment());

@@ -47,6 +47,9 @@ Omarchy theme live.
   expiry, a view limit and a password; hide your email or deactivate one.
   The link is copied when a Send is made; everything in it, file included,
   is encrypted before it leaves, and the key travels only in the link.
+- Exporting the vault as Bitwarden's apps do: JSON, CSV, or JSON encrypted
+  for this account or with a password of its own; Bitwarden and other
+  password managers import them. `vord export` does it from the terminal.
 - Cloning, moving to the Trash, restoring and deleting for good; creating,
   renaming and deleting folders.
 - Saving changes only what you changed. Passkeys, attachments and anything
@@ -64,9 +67,9 @@ The aim is to do what the Bitwarden desktop app does, in this order:
    and between its collections.~~ Done.
 4. ~~Attachments: downloading and uploading them.~~ Done.
 5. ~~Sends: sharing text and files by link.~~ Done.
-6. Unlocking with a PIN, exporting the vault, syncing the moment something
-   changes on the server, an SSH agent for the vault's SSH keys, more than
-   one account, and a tray icon.
+6. ~~Exporting the vault.~~ Done. Unlocking with a PIN, syncing the moment
+   something changes on the server, an SSH agent for the vault's SSH keys,
+   more than one account, and a tray icon.
 7. Two-step login with Duo or a FIDO2 security key, logging in by approving
    from another device, and SSO.
 
@@ -120,8 +123,9 @@ Vord follows the Bitwarden client protocol and does all decryption locally:
   one, before they're sent. Fields you didn't change keep their ciphertext.
   Websites carry the checksum Bitwarden's apps use to notice a URI swapped
   by a server.
-- The one decrypted thing Vord writes is an attachment you save, to the
-  place you pick.
+- The decrypted things Vord writes are an attachment you save and a plain
+  JSON or CSV export, which asks for your master password first; each goes
+  only where you pick, readable only by you.
 - A Send's key is in its link (after the `#`, which browsers don't send to
   the server), so Vord copies links as secrets: they're hidden from
   clipboard history and cleared like a password. A Send's password goes to

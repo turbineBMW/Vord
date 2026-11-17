@@ -42,6 +42,8 @@ src/edit.rs      Draft (an item as an editor holds it), `request` (the body that
                  `into_organization` (re-seal the item key, or re-encrypt it all, to share)
 src/send.rs      Sends: the seed sealed in `key`, HKDF to the Send's key, the link,
                  the password hash, `Draft` and `request` (as edit.rs, for Sends)
+src/export.rs    Bitwarden's export formats from the cached sync: JSON, CSV, encrypted
+                 JSON (account key) and password-protected JSON; own items only
 src/generator.rs passwords / passphrases / usernames, Bitwarden's rules; EFF list in data/
 src/totp.rs      otpauth://, steam://, bare base32; RFC 6238 vectors in the tests
 src/clipboard.rs secret copies carry x-kde-passwordManagerHint=secret; auto-clear
@@ -58,6 +60,7 @@ src/ui/detail.rs one item's widgets, rebuilt per selection; TOTP ticks on a time
                  stops when its label is gone
 src/ui/generator.rs the generator dialog; copied values live in Session.generated
 src/ui/editor.rs the item editor, shown in the details pane while editing
+src/ui/export.rs the Export Vault dialog
 src/ui/send.rs   a Send's row, details and editor (the Sends view of the same panes)
 src/ui/pages.rs  login, two-step and unlock pages;  src/ui/prefs.rs  preferences
 src/style.css    app CSS; colours only from libadwaita variables
@@ -68,8 +71,9 @@ tests/two-factor.js  turns on authenticator + email 2FA for it; prints TOTP / em
 
 ## Rules
 
-- **Nothing decrypted touches disk or logs**, except an attachment the user saves, to
-  the path they picked. `Debug` on keys, `Account` and `Totp` hides
+- **Nothing decrypted touches disk or logs**, except an attachment the user saves or
+  an export (after the master password is re-entered), to the path they picked,
+  mode 0600. `Debug` on keys, `Account` and `Totp` hides
   secrets; don't `{:?}` a struct holding them.
 - **A login waiting for its second step** holds the master key in `Ui::pending`
   (`Arc<PendingLogin>`). Cancel and screen lock drop it; worker results check
