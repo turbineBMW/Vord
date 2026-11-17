@@ -30,7 +30,8 @@ src/api.rs       prelogin, password + refresh grants (2FA: TwoFactorChallenge, S
                  send-email-login, sync, icons; `camel()` lower-cases the first letter of
                  every JSON key (Vaultwarden answers PascalCase)
 src/session.rs   login (Done | SecondStep(PendingLogin)) / second_step / unlock_key / sync /
-                 open_sync / change (save, favorite, trash, restore, purge, folders):
+                 open_sync / change (save, favorite, trash, restore, purge, folders,
+                 attachments, Sends):
                  blocking, run on workers; `change` folds the answer into vault.json
 src/store.rs     account.json + vault.json (still encrypted) in $XDG_DATA_HOME/vord, 0600;
                  device.json (device id + remember-2FA tokens) outlives logout; a
@@ -39,6 +40,8 @@ src/vault.rs     the decrypted model; one bad item is marked `damaged`, never fa
                  `Vault::raw` keeps each item as the server sent it
 src/edit.rs      Draft (an item as an editor holds it), `request` (the body that saves it),
                  `into_organization` (re-seal the item key, or re-encrypt it all, to share)
+src/send.rs      Sends: the seed sealed in `key`, HKDF to the Send's key, the link,
+                 the password hash, `Draft` and `request` (as edit.rs, for Sends)
 src/generator.rs passwords / passphrases / usernames, Bitwarden's rules; EFF list in data/
 src/totp.rs      otpauth://, steam://, bare base32; RFC 6238 vectors in the tests
 src/clipboard.rs secret copies carry x-kde-passwordManagerHint=secret; auto-clear
@@ -55,6 +58,7 @@ src/ui/detail.rs one item's widgets, rebuilt per selection; TOTP ticks on a time
                  stops when its label is gone
 src/ui/generator.rs the generator dialog; copied values live in Session.generated
 src/ui/editor.rs the item editor, shown in the details pane while editing
+src/ui/send.rs   a Send's row, details and editor (the Sends view of the same panes)
 src/ui/pages.rs  login, two-step and unlock pages;  src/ui/prefs.rs  preferences
 src/style.css    app CSS; colours only from libadwaita variables
 tests/vectors.js independent crypto vectors (Node) -> tests/vectors/*
@@ -118,10 +122,14 @@ cargo run -- login http://localhost:8222 test@vord.test [--method email] [--reme
 
 Writes against the seeded server: `cargo test -- --ignored live_changes` (folders,
 favorite, trash, restore, purge, refusing a stale copy, moving into the organization
-and between its collections, attachments both ways; it adds a collection and a
-`vord-upload.txt` on Router admin, to open in another client, each run). tests/seed.js puts recovery-codes.txt
-on GitHub, encrypted independently, for Vord to open. Vaultwarden only refuses a
-stale copy when the item changed more than a second after it.
+and between its collections, attachments both ways, Sends; it adds a collection, a
+`vord-upload.txt` on Router admin and two Sends, to open in another client, each run).
+tests/seed.js puts recovery-codes.txt on GitHub and makes two Sends (Door code, with
+the password "open sesame", and Floor plan, a file), all encrypted independently, for
+Vord to open. Vaultwarden only refuses a stale copy when the item changed more than a
+second after it. A Send link opens in the web vault at
+`https://localhost:8443/#/send/<accessId>/<key>`; a file Send's download address comes
+from `DOMAIN` (http://localhost:8222), which the https page won't fetch.
 
 Bitwarden's own web vault comes with Vaultwarden and is the check that what Vord
 writes opens elsewhere, but it refuses plain http. Put TLS in front:

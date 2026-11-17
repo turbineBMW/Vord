@@ -7,6 +7,7 @@ mod generator;
 mod icons;
 mod omarchy;
 mod screenlock;
+mod send;
 mod session;
 mod settings;
 mod sidebar;

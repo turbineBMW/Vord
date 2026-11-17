@@ -43,6 +43,10 @@ Omarchy theme live.
 - Attachments: save one where you choose, add files to an item, delete
   them. Each file is encrypted with a key of its own, as Bitwarden's apps
   do.
+- Sends: share a text or a file by link, with a deletion date, an optional
+  expiry, a view limit and a password; hide your email or deactivate one.
+  The link is copied when a Send is made; everything in it, file included,
+  is encrypted before it leaves, and the key travels only in the link.
 - Cloning, moving to the Trash, restoring and deleting for good; creating,
   renaming and deleting folders.
 - Saving changes only what you changed. Passkeys, attachments and anything
@@ -59,7 +63,7 @@ The aim is to do what the Bitwarden desktop app does, in this order:
    cloning, the Trash, password history, moving items into an organization
    and between its collections.~~ Done.
 4. ~~Attachments: downloading and uploading them.~~ Done.
-5. Sends: sharing text and files by link.
+5. ~~Sends: sharing text and files by link.~~ Done.
 6. Unlocking with a PIN, exporting the vault, syncing the moment something
    changes on the server, an SSH agent for the vault's SSH keys, more than
    one account, and a tray icon.
@@ -118,6 +122,10 @@ Vord follows the Bitwarden client protocol and does all decryption locally:
   by a server.
 - The one decrypted thing Vord writes is an attachment you save, to the
   place you pick.
+- A Send's key is in its link (after the `#`, which browsers don't send to
+  the server), so Vord copies links as secrets: they're hidden from
+  clipboard history and cleared like a password. A Send's password goes to
+  the server only as a PBKDF2 hash salted with that key.
 - Keys are zeroed when the vault locks, and every widget that showed
   decrypted text is destroyed, including an editor with unsaved changes.
 

@@ -203,6 +203,43 @@ async function call(method, path, body, token, form) {
   shared.key = enc(orgKey, itemKeyBytes);
   await call("POST", "/api/ciphers/create", { cipher: shared, collectionIds: [collectionId] }, token);
 
+  // Sends as Bitwarden's apps make them: a 16-byte seed sealed with the user
+  // key; HKDF of the seed (salt "bitwarden-send", info "send") encrypts the
+  // rest. A password goes as PBKDF2-SHA256 of it, salted with the seed.
+  const sendBody = (seed, key, s) => ({
+    type: s.type, key: enc(userKey, seed), name: enc(key, s.name), notes: s.notes ? enc(key, s.notes) : null,
+    text: s.text ? { text: enc(key, s.text), hidden: !!s.hidden } : null,
+    file: s.fileName ? { fileName: enc(key, s.fileName) } : null,
+    maxAccessCount: s.maxAccessCount ?? null, expirationDate: null,
+    deletionDate: new Date(Date.now() + 7 * 864e5).toISOString(),
+    password: s.password ? crypto.pbkdf2Sync(s.password, seed, 100000, 32, "sha256").toString("base64") : null,
+    disabled: false, hideEmail: false,
+  });
+  const newSend = () => {
+    const seed = crypto.randomBytes(16);
+    return [seed, split(Buffer.from(crypto.hkdfSync("sha256", seed, "bitwarden-send", "send", 64)))];
+  };
+  {
+    const [seed, key] = newSend();
+    await call("POST", "/api/sends", sendBody(seed, key, { type: 0, name: "Door code", notes: "For the plumber", text: "4711", hidden: true, maxAccessCount: 5, password: "open sesame" }), token);
+  }
+  {
+    const [seed, key] = newSend();
+    const k = key;
+    const iv = crypto.randomBytes(16);
+    const c = crypto.createCipheriv("aes-256-cbc", k.enc, iv);
+    const ct = Buffer.concat([c.update("Floor plan, ground floor\n"), c.final()]);
+    const mac = crypto.createHmac("sha256", k.mac).update(Buffer.concat([iv, ct])).digest();
+    const data = Buffer.concat([Buffer.from([2]), iv, mac, ct]);
+    const body = sendBody(seed, key, { type: 1, name: "Floor plan", fileName: "floor-plan.txt" });
+    const slot = await call("POST", "/api/sends/file/v2", { ...body, fileLength: data.length }, token);
+    const sent = slot.sendResponse;
+    const form = new FormData();
+    form.append("data", new Blob([data]), body.file.fileName);
+    const res = await fetch(`${SERVER}/api/sends/${sent.id}/file/${sent.file.id}`, { method: "POST", headers: { Authorization: `Bearer ${token}` }, body: form });
+    if (!res.ok) throw new Error(`send upload: ${res.status} ${await res.text()}`);
+  }
+
   console.log(`seeded ${EMAIL} on ${SERVER}`);
 })().catch((e) => {
   console.error(e.message);

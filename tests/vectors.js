@@ -52,3 +52,10 @@ const userKey = crypto.randomBytes(64);
 write("user_key", userKey.toString("hex"));
 write("protected_user_key", encString(encKey, macKey, userKey));
 write("encrypted_name", encString(userKey.subarray(0, 32), userKey.subarray(32), Buffer.from("Ünïcode name ✓")));
+
+// A Send's key: HKDF-SHA256 (extract, then expand) of its 16-byte seed, salt
+// "bitwarden-send", info "send"; its password, PBKDF2-SHA256 salted with
+// the seed, 100 000 rounds.
+const seed = Buffer.from("000102030405060708090a0b0c0d0e0f", "hex");
+write("send_key", Buffer.from(crypto.hkdfSync("sha256", seed, "bitwarden-send", "send", 64)).toString("hex"));
+write("send_password_hash", crypto.pbkdf2Sync("open sesame", seed, 100000, 32, "sha256").toString("base64"));

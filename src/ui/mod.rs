@@ -16,6 +16,7 @@ mod editor;
 mod generator;
 mod pages;
 mod prefs;
+mod send;
 mod vault;
 
 use crate::crypto::SymmetricKey;
@@ -728,6 +729,9 @@ impl Ui {
     }
 
     fn start_edit(self: &Rc<Self>) {
+        if let Some(id) = self.vault.selected_send_id() {
+            return self.start_send_edit(&id);
+        }
         self.with_selected_unlocked(|ui| {
             let Some((id, draft, _, _)) = ui.open_selected() else {
                 return;
@@ -754,7 +758,7 @@ impl Ui {
     }
 
     fn start_new(self: &Rc<Self>, kind: crate::vault::Kind) {
-        if !self.is_unlocked() || self.vault.editor().is_some() {
+        if !self.is_unlocked() || self.vault.editing() {
             return;
         }
         let Some(vault) = self.vault.current_vault() else {
@@ -772,6 +776,9 @@ impl Ui {
     }
 
     fn save_edit(self: &Rc<Self>) {
+        if self.vault.send_editor().is_some() {
+            return self.save_send();
+        }
         let Some(editor) = self.vault.editor() else {
             return;
         };
@@ -857,13 +864,142 @@ impl Ui {
         } else {
             "Item added"
         };
-        self.run_change(change, message, |ui, touched| {
+        self.run_change(change, message, |ui, _, touched| {
             ui.vault.end_edit(ui);
             match touched {
                 session::Touched::Item(id) => Some(Some(id)),
                 _ => None,
             }
         });
+    }
+
+    // ---- Sends ----------------------------------------------------------
+
+    fn start_new_send(self: &Rc<Self>, kind: crate::send::SendKind) {
+        if !self.is_unlocked() || self.vault.editing() {
+            return;
+        }
+        let editor = send::SendEditor::new(&crate::send::Draft::new(kind), None);
+        self.vault.show_send_editor(self, editor);
+    }
+
+    fn start_send_edit(self: &Rc<Self>, id: &str) {
+        let Some(vault) = self.vault.current_vault() else {
+            return;
+        };
+        let Some(send) = vault.send(id).filter(|s| !s.damaged) else {
+            return self.toast("This Send can't be edited: part of it won't decrypt.");
+        };
+        let editor = send::SendEditor::new(&crate::send::Draft::open(send), Some(send));
+        self.vault.show_send_editor(self, editor);
+    }
+
+    fn save_send(self: &Rc<Self>) {
+        let Some(editor) = self.vault.send_editor() else {
+            return;
+        };
+        let draft = editor.draft();
+        if let Some(problem) = draft.problem() {
+            return self.toast(problem);
+        }
+        let change = {
+            let session = self.session.borrow();
+            let Some(user) = session.as_ref().map(|s| &s.keys.user) else {
+                return;
+            };
+            let vault = self.vault.current_vault();
+            let base = match (&editor.id, &editor.original) {
+                (Some(id), Some(original)) => {
+                    let Some(raw) = vault.as_ref().and_then(|v| v.raw_sends.get(id)) else {
+                        return self.toast("This Send is no longer there.");
+                    };
+                    Some((raw, original))
+                }
+                _ => None,
+            };
+            let (body, key) = match crate::send::request(&draft, base, user) {
+                Ok(made) => made,
+                Err(why) => return self.toast(&why),
+            };
+            let file = match (&editor.id, draft.kind) {
+                (None, crate::send::SendKind::File) => editor.file().map(|path| (path, key)),
+                _ => None,
+            };
+            if file.is_some() {
+                self.toast("Uploading…");
+            }
+            session::Change::SaveSend {
+                id: editor.id.clone(),
+                body,
+                file,
+            }
+        };
+        self.vault.set_saving(true);
+        let new = editor.id.is_none();
+        let message = if new { "Send created" } else { "Send saved" };
+        self.run_change(change, message, move |ui, vault, touched| {
+            ui.vault.end_edit(ui);
+            match touched {
+                session::Touched::Send(id) => {
+                    // As Bitwarden's apps do: a new Send's link is copied,
+                    // ready to share.
+                    let server = ui.server().unwrap_or_default();
+                    if let Some(link) = vault
+                        .send(&id)
+                        .filter(|_| new)
+                        .and_then(|s| s.link(&server))
+                    {
+                        ui.copy("Link", &link, true);
+                    }
+                    Some(Some(id))
+                }
+                _ => None,
+            }
+        });
+    }
+
+    fn copy_send_link(self: &Rc<Self>) {
+        let Some(id) = self.vault.selected_send_id() else {
+            return;
+        };
+        let server = self.server().unwrap_or_default();
+        let link = self
+            .vault
+            .current_vault()
+            .and_then(|v| v.send(&id).and_then(|s| s.link(&server)));
+        if let Some(link) = link {
+            self.copy("Link", &link, true);
+        }
+    }
+
+    fn remove_send_password(self: &Rc<Self>) {
+        let Some(id) = self.vault.selected_send_id() else {
+            return;
+        };
+        self.confirm(
+            "Remove Password?",
+            "Anyone with the link can then open the Send.",
+            "_Remove",
+            move |ui| {
+                let change = session::Change::RemoveSendPassword(id.clone());
+                ui.run_change(change, "Password removed", |_, _, _| None);
+            },
+        );
+    }
+
+    fn delete_send(self: &Rc<Self>) {
+        let Some(id) = self.vault.selected_send_id() else {
+            return;
+        };
+        self.confirm(
+            "Delete Send?",
+            "Its link stops working at once. This can't be undone.",
+            "_Delete",
+            move |ui| {
+                let change = session::Change::DeleteSend(id.clone());
+                ui.run_change(change, "Send deleted", |_, _, _| Some(None));
+            },
+        );
     }
 
     fn toggle_favorite(self: &Rc<Self>) {
@@ -887,7 +1023,7 @@ impl Ui {
         } else {
             "Added to favorites"
         };
-        self.run_change(change, message, |_, _| None);
+        self.run_change(change, message, |_, _, _| None);
     }
 
     fn trash_item(self: &Rc<Self>) {
@@ -900,7 +1036,7 @@ impl Ui {
             "_Move to Trash",
             move |ui| {
                 let change = session::Change::Trash(id.clone());
-                ui.run_change(change, "Moved to the Trash", |_, _| Some(None));
+                ui.run_change(change, "Moved to the Trash", |_, _, _| Some(None));
             },
         );
     }
@@ -909,7 +1045,7 @@ impl Ui {
         let Some(id) = self.vault.selected_id() else {
             return;
         };
-        self.run_change(session::Change::Restore(id), "Item restored", |_, _| {
+        self.run_change(session::Change::Restore(id), "Item restored", |_, _, _| {
             Some(None)
         });
     }
@@ -924,7 +1060,7 @@ impl Ui {
             "_Delete Permanently",
             move |ui| {
                 let change = session::Change::Purge(id.clone());
-                ui.run_change(change, "Item deleted", |_, _| Some(None));
+                ui.run_change(change, "Item deleted", |_, _, _| Some(None));
             },
         );
     }
@@ -1050,7 +1186,7 @@ impl Ui {
                 path,
                 item_key,
             };
-            ui.run_change(change, "Attachment added", |_, _| None);
+            ui.run_change(change, "Attachment added", |_, _, _| None);
         });
     }
 
@@ -1065,7 +1201,7 @@ impl Ui {
                     id: id.clone(),
                     attachment: attachment.clone(),
                 };
-                ui.run_change(change, "Attachment deleted", |_, _| None);
+                ui.run_change(change, "Attachment deleted", |_, _, _| None);
             },
         );
     }
@@ -1116,7 +1252,7 @@ impl Ui {
                 "Folder created"
             };
             let change = session::Change::SaveFolder { id, name: sealed };
-            ui.run_change(change, message, |_, _| None);
+            ui.run_change(change, message, |_, _, _| None);
         });
         self.present_dialog(&dialog);
         entry.grab_focus();
@@ -1147,19 +1283,20 @@ impl Ui {
             "_Delete",
             move |ui| {
                 let change = session::Change::DeleteFolder(id.clone());
-                ui.run_change(change, "Folder deleted", |_, _| None);
+                ui.run_change(change, "Folder deleted", |_, _, _| None);
             },
         );
     }
 
     /// Send a change on a worker; on success show the vault as it now is
-    /// and say `done`. `after` runs first and may pick the item to select
+    /// and say `done`. `after` runs first, with the vault as it now is, and
+    /// may pick the item (or Send) to select
     /// (`Some(None)` selects nothing; `None` keeps the selection).
     fn run_change(
         self: &Rc<Self>,
         change: session::Change,
         done: &'static str,
-        after: impl Fn(&Rc<Ui>, session::Touched) -> Option<Option<String>> + 'static,
+        after: impl Fn(&Rc<Ui>, &Vault, session::Touched) -> Option<Option<String>> + 'static,
     ) {
         let Some(account) = self.account.borrow().clone() else {
             return;
@@ -1191,7 +1328,7 @@ impl Ui {
                         session.keys = unlocked.keys;
                     }
                     let vault = Rc::new(unlocked.vault);
-                    if let Some(select) = after(&ui, touched) {
+                    if let Some(select) = after(&ui, &vault, touched) {
                         ui.vault.select(&vault, select);
                     }
                     ui.vault.show_vault(&ui, vault, false);
@@ -1281,6 +1418,9 @@ impl Ui {
         action("new-folder", &[], |ui| ui.folder_name_dialog(None));
         action("rename-folder", &[], |ui| ui.rename_folder());
         action("delete-folder", &[], |ui| ui.delete_folder());
+        action("copy-send-link", &[], |ui| ui.copy_send_link());
+        action("remove-send-password", &[], |ui| ui.remove_send_password());
+        action("delete-send", &[], |ui| ui.delete_send());
         {
             let favorite = gio::SimpleAction::new_stateful("favorite", None, &false.to_variant());
             let weak = Rc::downgrade(self);
@@ -1307,6 +1447,18 @@ impl Ui {
             });
             self.window.add_action(&new_item);
             app.set_accels_for_action("win.new-item::login", &["<Control>n"]);
+            let new_send = gio::SimpleAction::new("new-send", Some(glib::VariantTy::STRING));
+            let weak = Rc::downgrade(self);
+            new_send.connect_activate(move |_, kind| {
+                let (Some(ui), Some(kind)) = (weak.upgrade(), kind.and_then(|k| k.str())) else {
+                    return;
+                };
+                ui.start_new_send(match kind {
+                    "file" => crate::send::SendKind::File,
+                    _ => crate::send::SendKind::Text,
+                });
+            });
+            self.window.add_action(&new_send);
         }
         action("logout", &[], |ui| ui.confirm_logout());
         action("preferences", &["<Control>comma"], prefs::show);
@@ -1344,6 +1496,8 @@ fn empty_vault() -> Vault {
         damaged: 0,
         raw: Default::default(),
         user_id: None,
+        sends: Vec::new(),
+        raw_sends: Default::default(),
     }
 }
 

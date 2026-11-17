@@ -13,7 +13,7 @@ use gtk::glib;
 use std::rc::Rc;
 use std::time::Duration;
 
-const MASK: &str = "••••••••••••";
+pub(super) const MASK: &str = "••••••••••••";
 
 pub fn open_url(ui: &Rc<Ui>, url: &str) {
     let launcher = gtk::UriLauncher::new(url);
@@ -31,7 +31,7 @@ pub fn open_url(ui: &Rc<Ui>, url: &str) {
     );
 }
 
-fn icon_button(icon: &str, tooltip: &str) -> gtk::Button {
+pub(super) fn icon_button(icon: &str, tooltip: &str) -> gtk::Button {
     gtk::Button::builder()
         .icon_name(icon)
         .tooltip_text(tooltip)
@@ -41,7 +41,7 @@ fn icon_button(icon: &str, tooltip: &str) -> gtk::Button {
 }
 
 /// Escape for the subtitle, which libadwaita reads as Pango markup.
-fn plain(text: &str) -> String {
+pub(super) fn plain(text: &str) -> String {
     glib::markup_escape_text(text).to_string()
 }
 
@@ -290,7 +290,7 @@ impl Builder<'_> {
     }
 }
 
-fn capitalise(text: &str) -> String {
+pub(super) fn capitalise(text: &str) -> String {
     let mut chars = text.chars();
     match chars.next() {
         Some(first) => first.to_uppercase().chain(chars).collect(),
@@ -299,7 +299,7 @@ fn capitalise(text: &str) -> String {
 }
 
 /// "12 Mar 2026, 14:05", in local time.
-fn when(iso: &str) -> Option<String> {
+pub(super) fn when(iso: &str) -> Option<String> {
     let time = glib::DateTime::from_iso8601(iso, Some(&glib::TimeZone::utc())).ok()?;
     let local = time.to_local().ok()?;
     Some(local.format("%e %b %Y, %H:%M").ok()?.trim().to_string())
