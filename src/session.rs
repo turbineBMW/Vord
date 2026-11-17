@@ -341,9 +341,17 @@ pub fn now_iso() -> String {
 pub enum Change {
     /// Create (`id` is `None`) or update an item; the body comes from
     /// [`crate::edit::request`]. A new organization item goes into
-    /// `collections`.
+    /// `collections`; a saved one moves to them when `move_collections`.
     SaveItem {
         id: Option<String>,
+        body: Value,
+        collections: Vec<String>,
+        move_collections: bool,
+    },
+    /// Move a personal item into an organization's `collections`; the body
+    /// is already encrypted for it ([`crate::edit::into_organization`]).
+    Share {
+        id: String,
         body: Value,
         collections: Vec<String>,
     },
@@ -409,16 +417,41 @@ pub fn change(mut account: Account, change: Change) -> Result<(Account, Value, T
         };
         Ok(match &change {
             Change::SaveItem {
-                id: Some(id), body, ..
-            } => Some(call(
-                Method::PUT,
-                &format!("/api/ciphers/{id}"),
-                Some(body),
-            )?),
+                id: Some(id),
+                body,
+                collections,
+                move_collections,
+            } => {
+                let saved = call(Method::PUT, &format!("/api/ciphers/{id}"), Some(body))?;
+                Some(if *move_collections {
+                    let body = serde_json::json!({ "collectionIds": collections });
+                    call(
+                        Method::PUT,
+                        &format!("/api/ciphers/{id}/collections"),
+                        Some(&body),
+                    )?;
+                    call(Method::GET, &format!("/api/ciphers/{id}"), None)?
+                } else {
+                    saved
+                })
+            }
+            Change::Share {
+                id,
+                body,
+                collections,
+            } => {
+                let wrapped = serde_json::json!({ "cipher": body, "collectionIds": collections });
+                Some(call(
+                    Method::PUT,
+                    &format!("/api/ciphers/{id}/share"),
+                    Some(&wrapped),
+                )?)
+            }
             Change::SaveItem {
                 id: None,
                 body,
                 collections,
+                ..
             } => Some(
                 if body.get("organizationId").is_some_and(Value::is_string) {
                     let wrapped =
@@ -577,6 +610,7 @@ mod live {
             id: None,
             body,
             collections: Vec::new(),
+            move_collections: false,
         };
         let (account, sync, touched) = change(account, save).unwrap();
         let Touched::Item(id) = touched else {
@@ -612,6 +646,7 @@ mod live {
                 id: Some(id.clone()),
                 body: edit::request(&edited, Some(base), &user_key, &saver),
                 collections: Vec::new(),
+                move_collections: false,
             }
         };
         std::thread::sleep(std::time::Duration::from_millis(2100));
@@ -636,6 +671,99 @@ mod live {
         let (account, _, _) = change(account, Change::Trash(id.clone())).unwrap();
         let (account, sync, _) = change(account, Change::Purge(id.clone())).unwrap();
         assert!(open(&account, &user_key, &sync).item(&id).is_none());
+
+        // A personal login moves into the organization, then to another
+        // of its collections.
+        let unlocked = open_sync(&account, user_key.clone(), &sync);
+        let family = unlocked
+            .vault
+            .organizations
+            .iter()
+            .find(|o| o.name == "Family")
+            .unwrap();
+        let org_key = unlocked.keys.orgs.get(&family.id).unwrap().clone();
+        let first = unlocked
+            .vault
+            .collections
+            .iter()
+            .find(|c| c.org_id == family.id)
+            .unwrap();
+        let (first, family) = (first.id.clone(), family.id.clone());
+        let mut account = account;
+        let second = authed(&mut account, |client, token| {
+            let body = serde_json::json!({
+                "name": org_key.encrypt_text("Second"), "groups": [], "users": []
+            });
+            let path = format!("/api/organizations/{family}/collections");
+            client.call(reqwest::Method::POST, &path, token, Some(&body))
+        })
+        .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let mut draft = Draft::new(Kind::Login);
+        draft.name = "Moving login".to_string().into();
+        draft.values[0] = "mover".to_string().into();
+        draft.uris.push(edit::Uri {
+            uri: "https://move.example".to_string().into(),
+            origin: None,
+        });
+        let save = Change::SaveItem {
+            id: None,
+            body: edit::request(&draft, None, &user_key, &saver),
+            collections: Vec::new(),
+            move_collections: false,
+        };
+        let (account, sync, touched) = change(account, save).unwrap();
+        let Touched::Item(id) = touched else {
+            panic!("no item")
+        };
+        let raw = sync["ciphers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["id"] == id.as_str())
+            .unwrap()
+            .clone();
+        let original = Draft::open(&raw, &user_key).unwrap();
+        let base = edit::Base {
+            raw: &raw,
+            original: &original,
+        };
+        let mut body = edit::request(&original, Some(base), &user_key, &saver);
+        edit::into_organization(&mut body, &raw, &user_key, &family, &org_key).unwrap();
+        let share = Change::Share {
+            id: id.clone(),
+            body,
+            collections: vec![first.clone()],
+        };
+        let (account, sync, _) = change(account, share).unwrap();
+        let unlocked = open_sync(&account, user_key.clone(), &sync);
+        let moved = unlocked.vault.item(&id).unwrap();
+        assert_eq!(moved.org_id.as_deref(), Some(family.as_str()));
+        assert_eq!(moved.collection_ids, std::slice::from_ref(&first));
+        assert!(!moved.damaged);
+        assert_eq!(
+            moved.login.as_ref().unwrap().uris[0].uri,
+            "https://move.example"
+        );
+
+        let raw = unlocked.vault.raw(&id).unwrap().clone();
+        let key = edit::item_key(&raw, &unlocked.keys).unwrap();
+        let original = Draft::open(&raw, &key).unwrap();
+        let base = edit::Base {
+            raw: &raw,
+            original: &original,
+        };
+        let save = Change::SaveItem {
+            id: Some(id.clone()),
+            body: edit::request(&original, Some(base), &key, &saver),
+            collections: vec![second.clone()],
+            move_collections: true,
+        };
+        let (account, sync, _) = change(account, save).unwrap();
+        let vault = open(&account, &user_key, &sync);
+        assert_eq!(vault.item(&id).unwrap().collection_ids, [second]);
 
         // The folder goes; the cache matches a fresh sync.
         let (account, sync, _) = change(account, Change::DeleteFolder(folder.clone())).unwrap();

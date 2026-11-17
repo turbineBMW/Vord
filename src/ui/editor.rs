@@ -40,9 +40,10 @@ pub struct Editor {
     /// The item as it opened, to tell what changed.
     pub original: Option<Draft>,
     kind: Kind,
-    /// An existing item's owner, which the editor doesn't change.
-    fixed_owner: Option<Option<String>>,
-    fixed_collections: Vec<String>,
+    /// A saved organization item's organization, which doesn't change.
+    fixed_org: Option<String>,
+    /// Collections it's in that the account can't change.
+    kept_collections: Vec<String>,
     name: adw::EntryRow,
     folder: adw::ComboRow,
     folder_ids: Vec<Option<String>>,
@@ -149,74 +150,99 @@ impl Editor {
         folder.set_selected(at as u32);
         details.add(&folder);
 
-        // A new item can go to an organization the account can write to.
+        // A personal item (new or saved) can go to an organization the
+        // account can write to; an organization's item stays in it, and
+        // only its collections change. Collections the account can't
+        // write to keep the item as they did.
+        let fixed_org = draft.org_id.clone().filter(|_| id.is_some());
+        let writable_collection =
+            |id: &str| vault.collections.iter().any(|c| c.id == id && !c.read_only);
+        let kept_collections: Vec<String> = draft
+            .collection_ids
+            .iter()
+            .filter(|c| !writable_collection(c))
+            .cloned()
+            .collect();
         let mut owner = None;
         let mut owner_ids = vec![None];
         let mut collections = Vec::new();
-        let (fixed_owner, fixed_collections) = if id.is_some() {
-            (Some(draft.org_id.clone()), draft.collection_ids.clone())
-        } else {
-            let writable: Vec<_> = vault
-                .organizations
-                .iter()
-                .filter(|o| {
-                    vault
-                        .collections
-                        .iter()
-                        .any(|c| c.org_id == o.id && !c.read_only)
-                })
-                .collect();
-            if !writable.is_empty() {
-                let mut names = vec!["Me (personal vault)".to_string()];
-                for org in &writable {
-                    owner_ids.push(Some(org.id.clone()));
-                    names.push(org.name.clone());
-                }
-                let row = adw::ComboRow::builder()
-                    .title("Owner")
-                    .model(&gtk::StringList::new(
-                        &names.iter().map(String::as_str).collect::<Vec<_>>(),
-                    ))
-                    .build();
-                row.set_use_markup(false);
-                let at = owner_ids
+        let writable: Vec<_> = vault
+            .organizations
+            .iter()
+            .filter(|o| match &fixed_org {
+                Some(org) => &o.id == org,
+                None => true,
+            })
+            .filter(|o| {
+                vault
+                    .collections
                     .iter()
-                    .position(|o| *o == draft.org_id)
-                    .unwrap_or(0);
-                row.set_selected(at as u32);
-                details.add(&row);
-                let chosen = group(&column, "Collections");
-                for collection in vault.collections.iter().filter(|c| !c.read_only) {
-                    let switch = adw::SwitchRow::builder()
-                        .title(&collection.name)
-                        .active(draft.collection_ids.contains(&collection.id))
-                        .build();
-                    switch.set_use_markup(false);
-                    chosen.add(&switch);
-                    collections.push((collection.id.clone(), collection.org_id.clone(), switch));
-                }
-                // Only the chosen organization's collections show.
-                let show = {
-                    let owner_ids = owner_ids.clone();
-                    let rows: Vec<_> = collections
-                        .iter()
-                        .map(|(_, org, row)| (org.clone(), row.clone()))
-                        .collect();
-                    let chosen = chosen.clone();
-                    move |row: &adw::ComboRow| {
-                        let org = owner_ids.get(row.selected() as usize).cloned().flatten();
-                        chosen.set_visible(org.is_some());
-                        for (owner, switch) in &rows {
-                            switch.set_visible(Some(owner) == org.as_ref());
-                        }
-                    }
-                };
-                show(&row);
-                row.connect_selected_notify(show);
-                owner = Some(row);
+                    .any(|c| c.org_id == o.id && !c.read_only)
+            })
+            .collect();
+        if fixed_org.is_none() && !writable.is_empty() {
+            let mut names = vec!["Me (personal vault)".to_string()];
+            for org in &writable {
+                owner_ids.push(Some(org.id.clone()));
+                names.push(org.name.clone());
             }
-            (None, Vec::new())
-        };
+            let row = adw::ComboRow::builder()
+                .title("Owner")
+                .model(&gtk::StringList::new(
+                    &names.iter().map(String::as_str).collect::<Vec<_>>(),
+                ))
+                .build();
+            row.set_use_markup(false);
+            if id.is_some() {
+                row.set_subtitle("An organization can't give it back");
+            }
+            let at = owner_ids
+                .iter()
+                .position(|o| *o == draft.org_id)
+                .unwrap_or(0);
+            row.set_selected(at as u32);
+            details.add(&row);
+            owner = Some(row);
+        }
+        if !writable.is_empty() {
+            let chosen = group(&column, "Collections");
+            for collection in vault
+                .collections
+                .iter()
+                .filter(|c| !c.read_only && writable.iter().any(|o| o.id == c.org_id))
+            {
+                let switch = adw::SwitchRow::builder()
+                    .title(&collection.name)
+                    .active(draft.collection_ids.contains(&collection.id))
+                    .build();
+                switch.set_use_markup(false);
+                chosen.add(&switch);
+                collections.push((collection.id.clone(), collection.org_id.clone(), switch));
+            }
+            // Only the owning organization's collections show.
+            let rows: Vec<_> = collections
+                .iter()
+                .map(|(_, org, row)| (org.clone(), row.clone()))
+                .collect();
+            let show = {
+                let owner_ids = owner_ids.clone();
+                let fixed_org = fixed_org.clone();
+                move |row: Option<&adw::ComboRow>| {
+                    let org = fixed_org.clone().or_else(|| {
+                        row.and_then(|r| owner_ids.get(r.selected() as usize).cloned())
+                            .flatten()
+                    });
+                    chosen.set_visible(org.is_some());
+                    for (owner, switch) in &rows {
+                        switch.set_visible(Some(owner) == org.as_ref());
+                    }
+                }
+            };
+            show(owner.as_ref());
+            if let Some(row) = &owner {
+                row.connect_selected_notify(move |row| show(Some(row)));
+            }
+        }
 
         let favorite = adw::SwitchRow::builder()
             .title("Favorite")
@@ -477,8 +503,8 @@ impl Editor {
             title,
             original,
             kind,
-            fixed_owner,
-            fixed_collections,
+            fixed_org,
+            kept_collections,
             name,
             folder,
             folder_ids,
@@ -500,23 +526,21 @@ impl Editor {
 
     /// The form, read back.
     pub fn draft(&self) -> Draft {
-        let org_id = match &self.fixed_owner {
-            Some(owner) => owner.clone(),
-            None => self
-                .owner
+        let org_id = self.fixed_org.clone().or_else(|| {
+            self.owner
                 .as_ref()
                 .and_then(|row| self.owner_ids.get(row.selected() as usize).cloned())
-                .flatten(),
-        };
-        let collection_ids = if self.fixed_owner.is_some() {
-            self.fixed_collections.clone()
-        } else {
-            self.collections
-                .iter()
-                .filter(|(_, org, row)| Some(org) == org_id.as_ref() && row.is_active())
-                .map(|(id, ..)| id.clone())
-                .collect()
-        };
+                .flatten()
+        });
+        let mut collection_ids: Vec<String> = self
+            .collections
+            .iter()
+            .filter(|(_, org, row)| Some(org) == org_id.as_ref() && row.is_active())
+            .map(|(id, ..)| id.clone())
+            .collect();
+        if org_id.is_some() {
+            collection_ids.extend(self.kept_collections.iter().cloned());
+        }
         let buffer = self.notes.buffer();
         let notes = buffer.text(&buffer.start_iter(), &buffer.end_iter(), false);
         Draft {

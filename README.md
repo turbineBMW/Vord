@@ -36,7 +36,8 @@ Omarchy theme live.
   (OTP), and "remember this device".
 - Creating and editing every item type, in your own vault or an
   organization's collections: websites, custom fields, notes, folder,
-  favorite and re-prompt. A new SSH key item gets a freshly made Ed25519 key.
+  favorite and re-prompt. Your own items can move into an organization, and
+  an organization's items between its collections. A new SSH key item gets a freshly made Ed25519 key.
 - A changed password goes into the item's password history (the last five,
   shown under the item), as do a hidden field's old values.
 - Cloning, moving to the Trash, restoring and deleting for good; creating,
@@ -51,10 +52,9 @@ The aim is to do what the Bitwarden desktop app does, in this order:
 
 1. ~~Two-step login with an authenticator app, email or a YubiKey.~~ Done.
 2. ~~Password, passphrase and username generator.~~ Done.
-3. Creating and editing items. Done: every item type, folders, favorites,
-   cloning, the Trash, password history. Still to do: moving an item from
-   your own vault into an organization, and changing an existing item's
-   collections.
+3. ~~Creating and editing items: every item type, folders, favorites,
+   cloning, the Trash, password history, moving items into an organization
+   and between its collections.~~ Done.
 4. Attachments: downloading and uploading them.
 5. Sends: sharing text and files by link.
 6. Unlocking with a PIN, exporting the vault, syncing the moment something
@@ -65,8 +65,6 @@ The aim is to do what the Bitwarden desktop app does, in this order:
 
 Until then:
 
-- Move an item into an organization, or change its collections, in the web
-  vault or another Bitwarden app; Vord picks the change up on its next sync.
 - Attachments are listed by name but can't be opened.
 - An account whose only second step is Duo or a FIDO2 key gets a clear error
   at login; one that also has an authenticator app or email can use those.

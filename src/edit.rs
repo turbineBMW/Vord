@@ -254,12 +254,16 @@ impl Draft {
         position(self.kind, key).map_or("", |i| &self.values[i])
     }
 
-    /// What's wrong with it, if it can't be saved.
-    pub fn problem(&self) -> Option<&'static str> {
+    /// What's wrong with it, if it can't be saved. `original` is the item
+    /// as it opened, for one that was saved before.
+    pub fn problem(&self, original: Option<&Draft>) -> Option<&'static str> {
         if self.name.trim().is_empty() {
             return Some("Give the item a name.");
         }
-        if self.org_id.is_some() && self.collection_ids.is_empty() {
+        // An organization item lives in at least one collection, unless it
+        // was saved in none (an admin's unassigned item).
+        let had_none = original.is_some_and(|o| o.org_id.is_some() && o.collection_ids.is_empty());
+        if self.org_id.is_some() && self.collection_ids.is_empty() && !had_none {
             return Some("Choose at least one collection.");
         }
         None
@@ -306,6 +310,80 @@ fn put(key: &SymmetricKey, old_cipher: Option<&Value>, old: Option<&str>, new: &
     } else {
         Value::String(key.encrypt_text(new))
     }
+}
+
+/// Re-encrypt every encrypted string in `value` from one key to another.
+fn rekey(value: &mut Value, from: &SymmetricKey, to: &SymmetricKey) -> Result<(), CryptoError> {
+    match value {
+        Value::String(text) if text.starts_with("2.") => {
+            let plain = text.parse::<EncString>()?.decrypt(from)?;
+            *text = to.encrypt(&plain).to_string();
+        }
+        Value::Array(items) => {
+            for item in items {
+                rekey(item, from, to)?;
+            }
+        }
+        Value::Object(map) => {
+            for item in map.values_mut() {
+                rekey(item, from, to)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Turn the save body of a personal item into one that moves it into an
+/// organization. An item with its own key only has that key sealed again
+/// with the organization's; otherwise every encrypted string, the
+/// attachments' names and keys too, is re-encrypted with it. An attachment
+/// without a key of its own is encrypted with the item's key itself and
+/// can't move without being uploaded again, so it refuses the move.
+pub fn into_organization(
+    body: &mut Value,
+    raw: &Value,
+    user: &SymmetricKey,
+    org_id: &str,
+    org: &SymmetricKey,
+) -> Result<(), String> {
+    let mut attachments = Map::new();
+    for attachment in array(raw.get("attachments")) {
+        let (Some(id), Some(_)) = (str_at(attachment, "id"), str_at(attachment, "key")) else {
+            return Err(
+                "This item has an attachment from an older app that can't be moved. Move it in the web vault."
+                    .into(),
+            );
+        };
+        attachments.insert(
+            id.into(),
+            json!({ "fileName": attachment.get("fileName"), "key": attachment.get("key") }),
+        );
+    }
+    let failed = |error: CryptoError| {
+        log::warn!("cannot re-encrypt an item for an organization: {error}");
+        "Part of this item won't decrypt, so it can't be moved.".to_string()
+    };
+    match body.get_mut("key") {
+        Some(Value::String(sealed)) => {
+            let bytes = sealed
+                .parse::<EncString>()
+                .and_then(|e| e.decrypt(user))
+                .map_err(failed)?;
+            *sealed = org.encrypt(&bytes).to_string();
+        }
+        _ => {
+            let mut attachments = Value::Object(attachments.clone());
+            rekey(body, user, org).map_err(failed)?;
+            rekey(&mut attachments, user, org).map_err(failed)?;
+            body["attachments2"] = attachments;
+        }
+    }
+    if body.get("attachments2").is_none() && !attachments.is_empty() {
+        body["attachments2"] = Value::Object(attachments);
+    }
+    body["organizationId"] = json!(org_id);
+    Ok(())
 }
 
 /// What Bitwarden's apps store beside a URI so a server can't swap it
@@ -615,10 +693,10 @@ mod tests {
     fn a_new_item_and_a_clone() {
         let key = SymmetricKey::generate();
         let mut draft = Draft::new(Kind::Card);
-        assert_eq!(draft.problem(), Some("Give the item a name."));
+        assert_eq!(draft.problem(None), Some("Give the item a name."));
         draft.name = Secret::new("Visa".into());
         draft.values[position(Kind::Card, "number").unwrap()] = Secret::new("4111".into());
-        assert_eq!(draft.problem(), None);
+        assert_eq!(draft.problem(None), None);
         let body = request(&draft, None, &key, &NOW);
         assert_eq!(body["type"], 3);
         assert_eq!(dec(&key, &body["card"]["number"]), "4111");
@@ -632,7 +710,9 @@ mod tests {
         let mut org = Draft::new(Kind::Login);
         org.name = Secret::new("Shared".into());
         org.org_id = Some("o1".into());
-        assert_eq!(org.problem(), Some("Choose at least one collection."));
+        assert_eq!(org.problem(None), Some("Choose at least one collection."));
+        let unassigned = org.clone();
+        assert_eq!(org.problem(Some(&unassigned)), None);
 
         let raw = json!({
             "id": "c1", "type": 1, "name": enc(&key, "Mail"),
@@ -650,6 +730,72 @@ mod tests {
         assert_eq!(body["passwordHistory"], Value::Null);
         assert_eq!(dec(&key, &body["login"]["password"]), "pw");
         assert_eq!(body["login"]["uris"][0]["match"], Value::Null);
+    }
+
+    #[test]
+    fn moving_into_an_organization() {
+        let user = SymmetricKey::generate();
+        let org = SymmetricKey::generate();
+        let dec_with = |key: &SymmetricKey, v: &Value| dec(key, v);
+
+        // No key of its own: everything is encrypted again.
+        let raw = json!({
+            "id": "c1", "type": 1, "name": enc(&user, "Mail"),
+            "login": { "password": enc(&user, "pw"), "fido2Credentials": [{ "keyValue": enc(&user, "pk") }] },
+            "attachments": [{ "id": "a1", "fileName": enc(&user, "f.pdf"), "key": enc(&user, "k") }]
+        });
+        let original = Draft::open(&raw, &user).unwrap();
+        let base = Base {
+            raw: &raw,
+            original: &original,
+        };
+        let mut body = request(&original, Some(base), &user, &NOW);
+        into_organization(&mut body, &raw, &user, "o1", &org).unwrap();
+        assert_eq!(body["organizationId"], "o1");
+        assert_eq!(dec_with(&org, &body["name"]), "Mail");
+        assert_eq!(dec_with(&org, &body["login"]["password"]), "pw");
+        assert_eq!(
+            dec_with(&org, &body["login"]["fido2Credentials"][0]["keyValue"]),
+            "pk"
+        );
+        assert_eq!(
+            dec_with(&org, &body["attachments2"]["a1"]["fileName"]),
+            "f.pdf"
+        );
+        assert_eq!(dec_with(&org, &body["attachments2"]["a1"]["key"]), "k");
+
+        // Its own key: only that is sealed again.
+        let item = SymmetricKey::generate();
+        let raw = json!({
+            "id": "c2", "type": 2, "name": enc(&item, "Note"),
+            "key": user.encrypt(&item.to_bytes()).to_string(),
+            "attachments": [{ "id": "a1", "fileName": enc(&item, "f.pdf"), "key": enc(&item, "k") }]
+        });
+        let original = Draft::open(&raw, &item).unwrap();
+        let base = Base {
+            raw: &raw,
+            original: &original,
+        };
+        let mut body = request(&original, Some(base), &item, &NOW);
+        into_organization(&mut body, &raw, &user, "o1", &org).unwrap();
+        assert_eq!(body["name"], raw["name"]);
+        assert_eq!(
+            body["attachments2"]["a1"]["key"],
+            raw["attachments"][0]["key"]
+        );
+        let sealed: EncString = body["key"].as_str().unwrap().parse().unwrap();
+        assert_eq!(*sealed.decrypt(&org).unwrap(), *item.to_bytes());
+
+        // An attachment from an older app can't move.
+        let raw = json!({ "id": "c3", "type": 2, "name": enc(&user, "Old"),
+                          "attachments": [{ "id": "a1", "fileName": enc(&user, "f") }] });
+        let original = Draft::open(&raw, &user).unwrap();
+        let base = Base {
+            raw: &raw,
+            original: &original,
+        };
+        let mut body = request(&original, Some(base), &user, &NOW);
+        assert!(into_organization(&mut body, &raw, &user, "o1", &org).is_err());
     }
 
     #[test]
