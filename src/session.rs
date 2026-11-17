@@ -282,17 +282,42 @@ fn access_token(client: &Client, account: &mut Account, force: bool) -> Result<S
     Ok(tokens.access_token)
 }
 
+/// Run an API call with a usable access token, refreshing it and trying
+/// once more if the server says it has expired. The account's tokens are
+/// saved when they change.
+fn authed<T>(
+    account: &mut Account,
+    run: impl Fn(&Client, &str) -> Result<T, ApiError>,
+) -> Result<T, Error> {
+    let client = Client::new(&account.server);
+    let before = account.access_token.clone();
+    let token = access_token(&client, account, false)?;
+    let result = match run(&client, &token) {
+        Err(ApiError::SessionExpired) => {
+            let token = access_token(&client, account, true)?;
+            run(&client, &token)
+        }
+        other => other,
+    };
+    if account.access_token != before {
+        account.save();
+    }
+    Ok(result?)
+}
+
 /// Fetch the vault, still encrypted, and keep it. Returns the updated
 /// account (new tokens, a changed user key) for the caller to hold.
 pub fn sync(mut account: Account) -> Result<(Account, Value), Error> {
-    let client = Client::new(&account.server);
-    let token = access_token(&client, &mut account, false)?;
-    let sync = match client.sync(&token) {
-        Err(ApiError::SessionExpired) => {
-            let token = access_token(&client, &mut account, true)?;
-            client.sync(&token)?
+    // A change Vord saves while the sync is on the wire makes the sync
+    // stale before it lands; fetch again rather than keep it.
+    let mut tries = 0;
+    let sync = loop {
+        let since = store::vault_generation();
+        let sync = authed(&mut account, |client, token| client.sync(token))?;
+        tries += 1;
+        if store::save_synced_vault(&sync, since) || tries == 3 {
+            break sync;
         }
-        other => other?,
     };
     if let Some(key) = sync.pointer("/profile/key").and_then(Value::as_str) {
         account.user_key = key.to_string();
@@ -301,8 +326,186 @@ pub fn sync(mut account: Account) -> Result<(Account, Value), Error> {
         account.private_key = Some(key.to_string());
     }
     account.save();
-    store::save_vault(&sync);
     Ok((account, sync))
+}
+
+/// The time now, as Bitwarden writes it (ISO 8601, UTC).
+pub fn now_iso() -> String {
+    gtk::glib::DateTime::now_utc()
+        .and_then(|t| t.format("%Y-%m-%dT%H:%M:%S.%fZ"))
+        .map(|t| t.to_string())
+        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".into())
+}
+
+/// A change to the vault, already encrypted.
+pub enum Change {
+    /// Create (`id` is `None`) or update an item; the body comes from
+    /// [`crate::edit::request`]. A new organization item goes into
+    /// `collections`.
+    SaveItem {
+        id: Option<String>,
+        body: Value,
+        collections: Vec<String>,
+    },
+    /// Favorite or not, which (like the folder) is the user's own and
+    /// needs no re-encryption.
+    Favorite {
+        id: String,
+        folder_id: Option<String>,
+        favorite: bool,
+    },
+    Trash(String),
+    Restore(String),
+    /// Delete for good.
+    Purge(String),
+    /// Create (`id` is `None`) or rename a folder; `name` is encrypted.
+    SaveFolder {
+        id: Option<String>,
+        name: String,
+    },
+    DeleteFolder(String),
+}
+
+/// What a change touched, for the view to select.
+pub enum Touched {
+    Item(String),
+    Nothing,
+}
+
+fn replace_by_id(list: &mut Value, id: &str, with: Option<Value>) {
+    if !list.is_array() {
+        *list = Value::Array(Vec::new());
+    }
+    let list = list.as_array_mut().expect("an array");
+    let at = list
+        .iter()
+        .position(|v| v.get("id").and_then(Value::as_str) == Some(id));
+    match (at, with) {
+        (Some(i), Some(with)) => list[i] = with,
+        (Some(i), None) => {
+            list.remove(i);
+        }
+        (None, Some(with)) => list.push(with),
+        (None, None) => {}
+    }
+}
+
+fn id_of(value: &Value) -> Result<String, Error> {
+    value
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| Error::Other("The server's answer had no id.".into()))
+}
+
+/// Send a change, then fold the server's answer into the cached vault.
+/// Returns the account (its tokens may be new), the vault as it now is,
+/// and what changed.
+pub fn change(mut account: Account, change: Change) -> Result<(Account, Value, Touched), Error> {
+    use reqwest::Method;
+    let result = authed(&mut account, |client, token| {
+        let call = |method: Method, path: &str, body: Option<&Value>| {
+            client.call(method, path, token, body)
+        };
+        Ok(match &change {
+            Change::SaveItem {
+                id: Some(id), body, ..
+            } => Some(call(
+                Method::PUT,
+                &format!("/api/ciphers/{id}"),
+                Some(body),
+            )?),
+            Change::SaveItem {
+                id: None,
+                body,
+                collections,
+            } => Some(
+                if body.get("organizationId").is_some_and(Value::is_string) {
+                    let wrapped =
+                        serde_json::json!({ "cipher": body, "collectionIds": collections });
+                    call(Method::POST, "/api/ciphers/create", Some(&wrapped))?
+                } else {
+                    call(Method::POST, "/api/ciphers", Some(body))?
+                },
+            ),
+            Change::Favorite {
+                id,
+                folder_id,
+                favorite,
+            } => {
+                let body = serde_json::json!({ "folderId": folder_id, "favorite": favorite });
+                Some(call(
+                    Method::PUT,
+                    &format!("/api/ciphers/{id}/partial"),
+                    Some(&body),
+                )?)
+            }
+            Change::Trash(id) => {
+                call(Method::PUT, &format!("/api/ciphers/{id}/delete"), None)?;
+                Some(call(Method::GET, &format!("/api/ciphers/{id}"), None)?)
+            }
+            Change::Restore(id) => Some(call(
+                Method::PUT,
+                &format!("/api/ciphers/{id}/restore"),
+                None,
+            )?),
+            Change::Purge(id) => {
+                call(Method::DELETE, &format!("/api/ciphers/{id}"), None)?;
+                None
+            }
+            Change::SaveFolder { id, name } => {
+                let body = serde_json::json!({ "name": name });
+                Some(match id {
+                    Some(id) => call(Method::PUT, &format!("/api/folders/{id}"), Some(&body))?,
+                    None => call(Method::POST, "/api/folders", Some(&body))?,
+                })
+            }
+            Change::DeleteFolder(id) => {
+                call(Method::DELETE, &format!("/api/folders/{id}"), None)?;
+                None
+            }
+        })
+    })
+    .map_err(|error| match error {
+        // Vaultwarden: "The client copy of this cipher is out of date."
+        Error::Api(ApiError::Rejected(why)) if why.contains("out of date") => Error::Other(
+            "This item changed elsewhere since Vord last synced. Sync, then make the change again."
+                .into(),
+        ),
+        other => other,
+    })?;
+
+    let touched = match (&change, &result) {
+        (Change::SaveFolder { .. } | Change::DeleteFolder(_) | Change::Purge(_), _) => {
+            Touched::Nothing
+        }
+        (_, Some(cipher)) => Touched::Item(id_of(cipher)?),
+        (_, None) => Touched::Nothing,
+    };
+    let sync = store::update_vault(|sync| match (&change, result) {
+        (Change::Purge(id), _) => replace_by_id(&mut sync["ciphers"], id, None),
+        (Change::DeleteFolder(id), _) => {
+            replace_by_id(&mut sync["folders"], id, None);
+            // The server moves its items to No Folder; so does the copy.
+            if let Some(ciphers) = sync["ciphers"].as_array_mut() {
+                for cipher in ciphers {
+                    if cipher.get("folderId").and_then(Value::as_str) == Some(id) {
+                        cipher["folderId"] = Value::Null;
+                    }
+                }
+            }
+        }
+        (Change::SaveFolder { .. }, Some(folder)) => {
+            let id = folder["id"].as_str().unwrap_or_default().to_string();
+            replace_by_id(&mut sync["folders"], &id, Some(folder));
+        }
+        (_, Some(cipher)) => {
+            let id = cipher["id"].as_str().unwrap_or_default().to_string();
+            replace_by_id(&mut sync["ciphers"], &id, Some(cipher));
+        }
+        (_, None) => {}
+    });
+    Ok((account, sync, touched))
 }
 
 /// Open a fresh sync with the user key in hand.
@@ -310,4 +513,148 @@ pub fn open_sync(account: &Account, user_key: SymmetricKey, sync: &Value) -> Unl
     let keys = Keys::new(user_key, sync, account.private_key.as_deref());
     let vault = Vault::open(sync, &keys);
     Unlocked { keys, vault }
+}
+
+/// Against the local test server from `tests/seed.js`, one run at a time:
+/// `cargo test -- --ignored live_changes`.
+#[cfg(test)]
+mod live {
+    use super::*;
+    use crate::edit::{self, Draft};
+    use crate::vault::Kind;
+
+    fn open(account: &Account, user_key: &SymmetricKey, sync: &Value) -> Vault {
+        open_sync(account, user_key.clone(), sync).vault
+    }
+
+    #[test]
+    #[ignore]
+    fn live_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("VORD_DATA_DIR", dir.path());
+        let Login::Done(account, user_key) = login(
+            "http://localhost:8222",
+            "test@vord.test",
+            "vord test password 1",
+        )
+        .unwrap() else {
+            panic!("the seeded account has no second step");
+        };
+        let (account, sync) = super::sync(account).unwrap();
+        let vault = open(&account, &user_key, &sync);
+        let saver = edit::Saver {
+            user_id: vault.user_id.as_deref(),
+            now: &now_iso(),
+        };
+
+        // A folder, renamed.
+        let name = user_key.encrypt_text("Live test");
+        let (account, sync, _) = change(account, Change::SaveFolder { id: None, name }).unwrap();
+        let vault = open(&account, &user_key, &sync);
+        let folder = vault
+            .folders
+            .iter()
+            .find(|f| f.name == "Live test")
+            .unwrap()
+            .id
+            .clone();
+        let name = user_key.encrypt_text("Live test renamed");
+        let change_folder = Change::SaveFolder {
+            id: Some(folder.clone()),
+            name,
+        };
+        let (account, sync, _) = change(account, change_folder).unwrap();
+        let vault = open(&account, &user_key, &sync);
+        assert!(vault.folders.iter().any(|f| f.name == "Live test renamed"));
+
+        // A note in it, favorited.
+        let mut draft = Draft::new(Kind::Note);
+        draft.name = "Live note".to_string().into();
+        draft.notes = "line one\nline two".to_string().into();
+        draft.folder_id = Some(folder.clone());
+        let body = edit::request(&draft, None, &user_key, &saver);
+        let save = Change::SaveItem {
+            id: None,
+            body,
+            collections: Vec::new(),
+        };
+        let (account, sync, touched) = change(account, save).unwrap();
+        let Touched::Item(id) = touched else {
+            panic!("no item")
+        };
+        let favorite = Change::Favorite {
+            id: id.clone(),
+            folder_id: Some(folder.clone()),
+            favorite: true,
+        };
+        let stale = open(&account, &user_key, &sync);
+        let (account, sync, _) = change(account, favorite).unwrap();
+        let vault = open(&account, &user_key, &sync);
+        let note = vault.item(&id).unwrap();
+        assert!(note.favorite && note.folder_id.as_deref() == Some(folder.as_str()));
+        assert_eq!(
+            note.notes.as_deref().map(String::as_str),
+            Some("line one\nline two")
+        );
+
+        // An edit; then another from the copy before it is refused (the
+        // server allows a second's slack).
+        let edit_from = |vault: &Vault, name: &str| {
+            let raw = vault.raw(&id).unwrap();
+            let original = Draft::open(raw, &user_key).unwrap();
+            let mut edited = original.clone();
+            edited.name = name.to_string().into();
+            let base = edit::Base {
+                raw,
+                original: &original,
+            };
+            Change::SaveItem {
+                id: Some(id.clone()),
+                body: edit::request(&edited, Some(base), &user_key, &saver),
+                collections: Vec::new(),
+            }
+        };
+        std::thread::sleep(std::time::Duration::from_millis(2100));
+        let (account, sync, _) = change(account, edit_from(&vault, "Live note 2")).unwrap();
+        assert_eq!(
+            open(&account, &user_key, &sync).item(&id).unwrap().name,
+            "Live note 2"
+        );
+        let refused = change(account.clone(), edit_from(&stale, "From a stale copy"))
+            .err()
+            .unwrap();
+        assert!(
+            refused.to_string().contains("changed elsewhere"),
+            "{refused}"
+        );
+
+        // Trash, restore, trash, delete for good.
+        let (account, sync, _) = change(account, Change::Trash(id.clone())).unwrap();
+        assert!(open(&account, &user_key, &sync).item(&id).unwrap().deleted);
+        let (account, sync, _) = change(account, Change::Restore(id.clone())).unwrap();
+        assert!(!open(&account, &user_key, &sync).item(&id).unwrap().deleted);
+        let (account, _, _) = change(account, Change::Trash(id.clone())).unwrap();
+        let (account, sync, _) = change(account, Change::Purge(id.clone())).unwrap();
+        assert!(open(&account, &user_key, &sync).item(&id).is_none());
+
+        // The folder goes; the cache matches a fresh sync.
+        let (account, sync, _) = change(account, Change::DeleteFolder(folder.clone())).unwrap();
+        assert!(!open(&account, &user_key, &sync)
+            .folders
+            .iter()
+            .any(|f| f.id == folder));
+        let (_, fresh) = super::sync(account).unwrap();
+        let ids = |s: &Value, key: &str| -> Vec<String> {
+            let mut ids: Vec<String> = s[key]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v["id"].as_str().unwrap().to_string())
+                .collect();
+            ids.sort();
+            ids
+        };
+        assert_eq!(ids(&sync, "ciphers"), ids(&fresh, "ciphers"));
+        assert_eq!(ids(&sync, "folders"), ids(&fresh, "folders"));
+    }
 }

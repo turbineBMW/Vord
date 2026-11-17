@@ -1,7 +1,7 @@
-//! The few Bitwarden server endpoints a read-only client needs, as
-//! Vaultwarden serves them: prelogin (the account's KDF), the password and
-//! refresh-token grants (with a second step when the account asks for one),
-//! sync, and website icons.
+//! The Bitwarden server endpoints Vord uses, as Vaultwarden serves them:
+//! prelogin (the account's KDF), the password and refresh-token grants (with
+//! a second step when the account asks for one), sync, website icons, and
+//! [`Client::call`] for the rest (saving items and folders).
 //!
 //! Calls block; the UI runs them on a worker thread.
 //!
@@ -445,6 +445,30 @@ impl Client {
             .send()
             .map_err(network)?;
         let (status, body) = Self::read(response)?;
+        match status.as_u16() {
+            200..=299 => Ok(body),
+            401 => Err(ApiError::SessionExpired),
+            _ => Err(error_from(status, &body)),
+        }
+    }
+
+    /// Any other API call, with a JSON body or none. An empty answer is
+    /// `Null`.
+    pub fn call(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        access_token: &str,
+        body: Option<&Value>,
+    ) -> Result<Value, ApiError> {
+        let mut request = self
+            .http
+            .request(method, self.url(path))
+            .bearer_auth(access_token);
+        if let Some(body) = body {
+            request = request.json(body);
+        }
+        let (status, body) = Self::read(request.send().map_err(network)?)?;
         match status.as_u16() {
             200..=299 => Ok(body),
             401 => Err(ApiError::SessionExpired),

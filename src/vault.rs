@@ -61,7 +61,8 @@ impl Keys {
         keys
     }
 
-    fn for_org(&self, org: Option<&str>) -> Option<&SymmetricKey> {
+    /// The key that owns an item: its organisation's, or the user key.
+    pub fn for_org(&self, org: Option<&str>) -> Option<&SymmetricKey> {
         match org {
             Some(org) => self.orgs.get(org),
             None => Some(&self.user),
@@ -86,6 +87,8 @@ pub struct Collection {
     pub id: String,
     pub org_id: String,
     pub name: String,
+    /// The account may see its items but not add to it.
+    pub read_only: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -107,6 +110,28 @@ impl Kind {
             5 => Self::SshKey,
             _ => return None,
         })
+    }
+
+    /// Bitwarden's number for the type.
+    pub fn number(self) -> u64 {
+        match self {
+            Self::Login => 1,
+            Self::Note => 2,
+            Self::Card => 3,
+            Self::Identity => 4,
+            Self::SshKey => 5,
+        }
+    }
+
+    /// The key of the type's own object in an item.
+    pub fn object(self) -> &'static str {
+        match self {
+            Self::Login => "login",
+            Self::Note => "secureNote",
+            Self::Card => "card",
+            Self::Identity => "identity",
+            Self::SshKey => "sshKey",
+        }
     }
 
     pub const ALL: [Kind; 5] = [
@@ -253,6 +278,14 @@ pub struct Field {
     pub kind: FieldKind,
 }
 
+/// A password the item had before, or a hidden field's earlier value
+/// ("name: value").
+#[derive(Clone)]
+pub struct PastPassword {
+    pub password: Secret,
+    pub until: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct Item {
     pub id: String,
@@ -274,9 +307,12 @@ pub struct Item {
     pub ssh_key: Option<SshKey>,
     pub fields: Vec<Field>,
     pub attachments: Vec<String>,
-    pub password_history: usize,
+    /// Newest first.
+    pub password_history: Vec<PastPassword>,
     /// Some field would not decrypt; what showed is what opened.
     pub damaged: bool,
+    /// Whether this account may change it (an organization can say no).
+    pub edit: bool,
 }
 
 impl Item {
@@ -341,6 +377,11 @@ pub struct Vault {
     pub items: Vec<Item>,
     /// Items with at least one field that would not decrypt.
     pub damaged: usize,
+    /// Each item as the server sent it, still encrypted: an edit starts
+    /// from it, so what Vord doesn't model survives a save.
+    pub raw: HashMap<String, Value>,
+    /// The account's id on the server.
+    pub user_id: Option<String>,
 }
 
 fn array(value: Option<&Value>) -> &[Value] {
@@ -420,7 +461,16 @@ impl Vault {
                 let org_id = str_at(collection, "organizationId")?.to_string();
                 let name = decrypt_name(str_at(collection, "name"), keys.orgs.get(&org_id))
                     .unwrap_or_else(|| "Unreadable collection".into());
-                Some(Collection { id, org_id, name })
+                let read_only = collection
+                    .get("readOnly")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                Some(Collection {
+                    id,
+                    org_id,
+                    name,
+                    read_only,
+                })
             })
             .collect();
         collections.sort_by_key(|c| c.name.to_lowercase());
@@ -434,17 +484,31 @@ impl Vault {
         if damaged > 0 {
             log::warn!("{damaged} item(s) did not fully decrypt");
         }
+        let raw = array(sync.get("ciphers"))
+            .iter()
+            .filter_map(|cipher| Some((str_at(cipher, "id")?.to_string(), cipher.clone())))
+            .collect();
         Self {
             organizations,
             folders,
             collections,
             items,
             damaged,
+            raw,
+            user_id: sync
+                .pointer("/profile/id")
+                .and_then(Value::as_str)
+                .map(str::to_string),
         }
     }
 
     pub fn item(&self, id: &str) -> Option<&Item> {
         self.items.iter().find(|i| i.id == id)
+    }
+
+    /// An item as the server sent it, still encrypted.
+    pub fn raw(&self, id: &str) -> Option<&Value> {
+        self.raw.get(id)
     }
 }
 
@@ -608,8 +672,17 @@ fn open_item(cipher: &Value, keys: &Keys) -> Option<Item> {
         ssh_key,
         fields,
         attachments,
-        password_history: array(cipher.get("passwordHistory")).len(),
+        password_history: array(cipher.get("passwordHistory"))
+            .iter()
+            .filter_map(|p| {
+                Some(PastPassword {
+                    password: open.secret(p, "password")?,
+                    until: str_at(p, "lastUsedDate").map(str::to_string),
+                })
+            })
+            .collect(),
         damaged: open.failed || item_key_failed,
+        edit: cipher.get("edit").and_then(Value::as_bool).unwrap_or(true),
         org_id,
     })
 }

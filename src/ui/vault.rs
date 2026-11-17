@@ -11,10 +11,10 @@
 //! Lists are never changed from inside their own selection signals (a GTK
 //! rule Rustle learned the hard way): rebuilding waits for an idle.
 
-use super::{detail, Ui};
+use super::{detail, editor::Editor, Ui};
 use crate::vault::{Item, Kind, Vault};
 use adw::prelude::*;
-use gtk::glib;
+use gtk::{gio, glib};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
@@ -76,6 +76,15 @@ pub struct VaultView {
     detail_stack: gtk::Stack,
     detail_scroller: gtk::ScrolledWindow,
     detail_page: adw::NavigationPage,
+    detail_title: adw::WindowTitle,
+    /// The details' own buttons, hidden while an item is edited.
+    view_buttons: Vec<gtk::Widget>,
+    edit_cancel: gtk::Button,
+    edit_save: gtk::Button,
+    new_button: gtk::MenuButton,
+    folder_menu: gtk::MenuButton,
+    /// The open editor. While there is one, the lists can't be used.
+    editor: RefCell<Option<Rc<Editor>>>,
     vault: RefCell<Option<Rc<Vault>>>,
     filter: RefCell<Filter>,
     selected: RefCell<Option<String>>,
@@ -123,6 +132,7 @@ impl VaultView {
         let menu = gtk::gio::Menu::new();
         let section = gtk::gio::Menu::new();
         section.append(Some("_Generator"), Some("win.generator"));
+        section.append(Some("New _Folder…"), Some("win.new-folder"));
         section.append(Some("_Sync Now"), Some("win.sync"));
         section.append(Some("_Lock"), Some("win.lock"));
         menu.append_section(None, &section);
@@ -205,6 +215,32 @@ impl VaultView {
                 .action_name("win.lock")
                 .build(),
         );
+        let new_menu = gio::Menu::new();
+        for (label, kind) in [
+            ("_Login", "login"),
+            ("_Card", "card"),
+            ("_Identity", "identity"),
+            ("Secure _Note", "note"),
+            ("_SSH Key", "ssh-key"),
+        ] {
+            new_menu.append(Some(label), Some(&format!("win.new-item::{kind}")));
+        }
+        let new_button = gtk::MenuButton::builder()
+            .icon_name("list-add-symbolic")
+            .tooltip_text("New Item (Ctrl+N for a login)")
+            .menu_model(&new_menu)
+            .build();
+        list_header.pack_end(&new_button);
+        let folder_actions = gio::Menu::new();
+        folder_actions.append(Some("_Rename Folder…"), Some("win.rename-folder"));
+        folder_actions.append(Some("_Delete Folder…"), Some("win.delete-folder"));
+        let folder_menu = gtk::MenuButton::builder()
+            .icon_name("view-more-symbolic")
+            .tooltip_text("Folder")
+            .menu_model(&folder_actions)
+            .visible(false)
+            .build();
+        list_header.pack_end(&folder_menu);
         let search = gtk::SearchEntry::builder()
             .placeholder_text("Search vault")
             .css_classes(["list-search"])
@@ -232,8 +268,9 @@ impl VaultView {
         let detail_stack = gtk::Stack::new();
         detail_stack.add_named(&detail_empty, Some("empty"));
         detail_stack.add_named(&detail_scroller, Some("item"));
+        let detail_title = adw::WindowTitle::new("Details", "");
         let detail_header = adw::HeaderBar::builder()
-            .title_widget(&adw::WindowTitle::new("Details", ""))
+            .title_widget(&detail_title)
             .build();
         let quick = gtk::Box::builder().css_classes(["linked"]).build();
         for (icon, tip, action) in [
@@ -262,13 +299,56 @@ impl VaultView {
             );
         }
         detail_header.pack_start(&quick);
-        detail_header.pack_start(
-            &gtk::Button::builder()
-                .icon_name("web-browser-symbolic")
-                .tooltip_text("Open Website (Ctrl+O)")
-                .action_name("win.open-website")
-                .build(),
-        );
+        let open_website = gtk::Button::builder()
+            .icon_name("web-browser-symbolic")
+            .tooltip_text("Open Website (Ctrl+O)")
+            .action_name("win.open-website")
+            .build();
+        detail_header.pack_start(&open_website);
+        let item_menu = gio::Menu::new();
+        let section = gio::Menu::new();
+        section.append(Some("_Favorite"), Some("win.favorite"));
+        section.append(Some("_Clone"), Some("win.clone-item"));
+        item_menu.append_section(None, &section);
+        let section = gio::Menu::new();
+        for (label, action) in [
+            ("Move to _Trash", "win.trash-item"),
+            ("_Restore", "win.restore-item"),
+            ("_Delete Permanently…", "win.purge-item"),
+        ] {
+            let entry = gio::MenuItem::new(Some(label), Some(action));
+            entry.set_attribute_value("hidden-when", Some(&"action-disabled".to_variant()));
+            section.append_item(&entry);
+        }
+        item_menu.append_section(None, &section);
+        let more = gtk::MenuButton::builder()
+            .icon_name("view-more-symbolic")
+            .tooltip_text("More")
+            .menu_model(&item_menu)
+            .build();
+        detail_header.pack_end(&more);
+        let edit = gtk::Button::builder()
+            .icon_name("document-edit-symbolic")
+            .tooltip_text("Edit (Ctrl+E)")
+            .action_name("win.edit-item")
+            .build();
+        detail_header.pack_end(&edit);
+        let edit_cancel = gtk::Button::builder()
+            .label("_Cancel")
+            .use_underline(true)
+            .action_name("win.cancel-edit")
+            .visible(false)
+            .build();
+        detail_header.pack_start(&edit_cancel);
+        let edit_save = gtk::Button::builder()
+            .label("_Save")
+            .use_underline(true)
+            .tooltip_text("Save (Ctrl+S)")
+            .action_name("win.save-item")
+            .css_classes(["suggested-action"])
+            .visible(false)
+            .build();
+        detail_header.pack_end(&edit_save);
         let detail_view = adw::ToolbarView::builder().content(&detail_stack).build();
         detail_view.add_top_bar(&detail_header);
         let detail_page = adw::NavigationPage::builder()
@@ -313,6 +393,18 @@ impl VaultView {
             detail_stack,
             detail_scroller,
             detail_page,
+            detail_title,
+            view_buttons: vec![
+                quick.upcast(),
+                open_website.upcast(),
+                edit.upcast(),
+                more.upcast(),
+            ],
+            edit_cancel,
+            edit_save,
+            new_button,
+            folder_menu,
+            editor: RefCell::new(None),
             vault: RefCell::new(None),
             filter: RefCell::new(Filter::All),
             selected: RefCell::new(None),
@@ -501,6 +593,7 @@ impl VaultView {
 
     /// Forget everything decrypted: rows, details, the vault itself.
     pub fn clear(&self) {
+        self.close_editor();
         self.rebuilding.set(true);
         self.item_list.remove_all();
         self.sidebar_list.remove_all();
@@ -600,13 +693,27 @@ impl VaultView {
                     if label.is_empty() {
                         row.set_child(Some(&gtk::Box::builder().height_request(10).build()));
                     } else {
-                        row.set_child(Some(
+                        let heading = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+                        heading.append(
                             &gtk::Label::builder()
                                 .label(&label)
                                 .xalign(0.0)
+                                .hexpand(true)
                                 .css_classes(["vault-heading"])
                                 .build(),
-                        ));
+                        );
+                        if label == "FOLDERS" {
+                            heading.append(
+                                &gtk::Button::builder()
+                                    .icon_name("list-add-symbolic")
+                                    .tooltip_text("New Folder")
+                                    .action_name("win.new-folder")
+                                    .css_classes(["flat", "heading-button"])
+                                    .valign(gtk::Align::Center)
+                                    .build(),
+                            );
+                        }
+                        row.set_child(Some(&heading));
                     }
                 }
                 Some(filter) => {
@@ -696,6 +803,8 @@ impl VaultView {
         self.rebuilding.set(false);
 
         self.list_title.set_title(&self.filter_title(&vault));
+        self.folder_menu
+            .set_visible(matches!(filter, Filter::Folder(Some(_))));
         if selected_row.is_none() {
             self.selected.replace(None);
         }
@@ -756,6 +865,12 @@ impl VaultView {
     }
 
     pub fn show_detail(&self, ui: &Rc<Ui>) {
+        if self.editor.borrow().is_some() {
+            // A sync while editing leaves the form alone; the save finds
+            // out if the item changed meanwhile.
+            self.update_item_actions(ui);
+            return;
+        }
         match self.selected_item() {
             Some((vault, id)) => {
                 let item = vault.item(&id).expect("checked");
@@ -763,6 +878,7 @@ impl VaultView {
                 self.detail_scroller.set_child(Some(&widget));
                 self.detail_stack.set_visible_child_name("item");
                 self.detail_page.set_title(&item.name);
+                self.detail_title.set_title("Details");
             }
             None => {
                 self.detail_scroller.set_child(None::<&gtk::Widget>);
@@ -775,8 +891,31 @@ impl VaultView {
     }
 
     pub fn update_item_actions(&self, ui: &Ui) {
-        let selected = self.selected_item();
+        let editing = self.editor.borrow().is_some();
+        let selected = if editing { None } else { self.selected_item() };
         let item = selected.as_ref().and_then(|(vault, id)| vault.item(id));
+        let live = item.filter(|i| !i.deleted);
+        let trashed = item.filter(|i| i.deleted);
+        ui.set_action_enabled("edit-item", live.is_some_and(|i| i.edit && !i.damaged));
+        ui.set_action_enabled("clone-item", live.is_some_and(|i| !i.damaged));
+        ui.set_action_enabled("favorite", live.is_some());
+        if let Some(action) = ui
+            .window
+            .lookup_action("favorite")
+            .and_downcast::<gio::SimpleAction>()
+        {
+            action.set_state(&live.is_some_and(|i| i.favorite).to_variant());
+        }
+        ui.set_action_enabled("trash-item", live.is_some_and(|i| i.edit));
+        ui.set_action_enabled("restore-item", trashed.is_some_and(|i| i.edit));
+        ui.set_action_enabled("purge-item", trashed.is_some_and(|i| i.edit));
+        ui.set_action_enabled("new-item", !editing);
+        ui.set_action_enabled("new-folder", !editing);
+        let in_folder = matches!(&*self.filter.borrow(), Filter::Folder(Some(_)));
+        ui.set_action_enabled("rename-folder", in_folder && !editing);
+        ui.set_action_enabled("delete-folder", in_folder && !editing);
+        ui.set_action_enabled("save-item", editing);
+        ui.set_action_enabled("cancel-edit", editing);
         let login = item.and_then(|i| i.login.as_ref());
         ui.set_action_enabled(
             "copy-username",
@@ -798,6 +937,96 @@ impl VaultView {
             "open-website",
             login.is_some_and(|l| l.uris.iter().any(|u| u.launch_url().is_some())),
         );
+    }
+
+    /// The selected item's id, if it's still in the vault.
+    pub fn selected_id(&self) -> Option<String> {
+        self.selected_item().map(|(_, id)| id)
+    }
+
+    pub fn current_vault(&self) -> Option<Rc<Vault>> {
+        self.vault.borrow().clone()
+    }
+
+    pub fn current_filter(&self) -> Filter {
+        self.filter.borrow().clone()
+    }
+
+    pub fn editor(&self) -> Option<Rc<Editor>> {
+        self.editor.borrow().clone()
+    }
+
+    /// Show `editor` in place of the details. The lists wait until it's
+    /// saved or cancelled.
+    pub fn show_editor(&self, ui: &Rc<Ui>, editor: Rc<Editor>) {
+        self.detail_scroller.set_child(Some(&editor.root));
+        self.detail_stack.set_visible_child_name("item");
+        self.detail_title.set_title(&editor.title);
+        self.detail_page.set_title(&editor.title);
+        self.detail_page.set_can_pop(false);
+        self.set_editing(true);
+        self.editor.replace(Some(editor.clone()));
+        self.inner.set_show_content(true);
+        self.update_item_actions(ui);
+        editor.focus();
+    }
+
+    fn set_editing(&self, editing: bool) {
+        for widget in &self.view_buttons {
+            widget.set_visible(!editing);
+        }
+        self.edit_cancel.set_visible(editing);
+        self.edit_save.set_visible(editing);
+        self.edit_save.set_sensitive(true);
+        for widget in [
+            self.sidebar_list.upcast_ref::<gtk::Widget>(),
+            self.item_list.upcast_ref(),
+            self.search.upcast_ref(),
+            self.new_button.upcast_ref(),
+            self.folder_menu.upcast_ref(),
+            self.sync_button.upcast_ref(),
+        ] {
+            widget.set_sensitive(!editing);
+        }
+    }
+
+    /// While a save is on its way.
+    pub fn set_saving(&self, saving: bool) {
+        self.edit_save.set_sensitive(!saving);
+        self.edit_cancel.set_sensitive(!saving);
+    }
+
+    fn close_editor(&self) {
+        if self.editor.take().is_some() {
+            self.detail_scroller.set_child(None::<&gtk::Widget>);
+            self.detail_page.set_can_pop(true);
+            self.detail_title.set_title("Details");
+            self.set_editing(false);
+            self.edit_cancel.set_sensitive(true);
+        }
+    }
+
+    /// Back to the details, the form dropped.
+    pub fn end_edit(&self, ui: &Rc<Ui>) {
+        self.close_editor();
+        self.show_detail(ui);
+    }
+
+    /// Select an item (or none) once the vault shows it, switching to All
+    /// Items (or the Trash) if the current view doesn't hold it.
+    pub fn select(&self, vault: &Vault, id: Option<String>) {
+        if let Some(id) = &id {
+            if let Some(item) = vault.item(id) {
+                if !self.filter.borrow().accepts(item) {
+                    self.filter.replace(if item.deleted {
+                        Filter::Trash
+                    } else {
+                        Filter::All
+                    });
+                }
+            }
+        }
+        self.selected.replace(id);
     }
 
     pub fn copy_field(&self, ui: &Rc<Ui>, what: Quick) {
