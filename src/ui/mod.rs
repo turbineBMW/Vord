@@ -114,6 +114,9 @@ pub struct Ui {
     agent_allowed: RefCell<std::collections::HashSet<String>>,
     /// Requests to sign that wait for the vault to be unlocked.
     agent_waiting: RefCell<Vec<agent::Waiting>>,
+    /// Other accounts' PIN seals, kept in memory while another account is
+    /// in use, so switching back still opens with the PIN.
+    pin_stash: RefCell<std::collections::HashMap<String, String>>,
     /// The tray icon, while it's shown.
     tray: RefCell<Option<ksni::blocking::Handle<crate::tray::Tray>>>,
 }
@@ -178,7 +181,9 @@ pub fn build(app: &adw::Application) -> Rc<Ui> {
         agent_allowed: RefCell::new(Default::default()),
         agent_waiting: RefCell::new(Vec::new()),
         tray: RefCell::new(None),
+        pin_stash: RefCell::new(Default::default()),
     });
+    ui.unlock.accounts.set_menu_model(Some(&ui.vault.switcher));
     THE_UI.with(|w| w.replace(Rc::downgrade(&ui)));
     ui.login.connect(&ui);
     ui.two_factor.connect(&ui);
@@ -228,14 +233,16 @@ impl Ui {
     fn start(self: &Rc<Self>) {
         match Account::load() {
             Some(account) => {
-                self.pin_sealed.replace(store::load_pin().sealed);
+                self.pin_sealed.replace(store::load_pin(&account).sealed);
                 self.unlock
                     .set_pin_available(self.pin_sealed.borrow().is_some());
                 self.unlock.show_account(&account);
                 self.account.replace(Some(account));
+                self.refresh_accounts();
                 self.show_page("unlock");
             }
             None => {
+                self.refresh_accounts();
                 let settings = settings::get();
                 self.login
                     .prefill(&settings.last_server, &settings.last_email);
@@ -378,9 +385,121 @@ impl Ui {
         });
         self.pending.replace(None);
         self.login.clear_password();
+        self.login.set_adding(false);
+        self.stash_pin();
+        self.pin_attempts.set(0);
+        self.unlock.set_pin_available(false);
         self.unlock.show_account(&account);
         self.account.replace(Some(account));
+        self.refresh_accounts();
         self.opened(keys, vault);
+    }
+
+    // ---- accounts -----------------------------------------------------
+
+    /// The accounts menu as the store has them, the one in use checked.
+    fn refresh_accounts(&self) {
+        let menu = &self.vault.accounts;
+        menu.remove_all();
+        for account in store::accounts() {
+            let host = url::Url::parse(&account.server)
+                .ok()
+                .and_then(|u| u.host_str().map(str::to_string))
+                .unwrap_or_else(|| account.server.clone());
+            let item = gio::MenuItem::new(Some(&format!("{} on {host}", account.email)), None);
+            item.set_action_and_target_value(
+                Some("win.switch-account"),
+                Some(&account.id().to_variant()),
+            );
+            menu.append_item(&item);
+        }
+        let active = self
+            .account
+            .borrow()
+            .as_ref()
+            .map(Account::id)
+            .unwrap_or_default();
+        if let Some(action) = self
+            .window
+            .lookup_action("switch-account")
+            .and_downcast::<gio::SimpleAction>()
+        {
+            action.set_state(&active.to_variant());
+        }
+    }
+
+    /// Set the account in use's in-memory PIN seal aside.
+    fn stash_pin(&self) {
+        if let (Some(account), Some(sealed)) =
+            (self.account.borrow().as_ref(), self.pin_sealed.take())
+        {
+            self.pin_stash.borrow_mut().insert(account.id(), sealed);
+        }
+    }
+
+    /// Make `account` the one in use, at its lock screen.
+    fn use_account(self: &Rc<Self>, account: Account) {
+        account.set_active();
+        self.stash_pin();
+        agent::forget(self);
+        let sealed = self
+            .pin_stash
+            .borrow_mut()
+            .remove(&account.id())
+            .or(store::load_pin(&account).sealed);
+        self.unlock.set_pin_available(sealed.is_some());
+        self.pin_sealed.replace(sealed);
+        self.pin_attempts.set(0);
+        self.unlock.clear_password();
+        self.unlock.show_account(&account);
+        self.login.set_adding(false);
+        self.account.replace(Some(account));
+        self.refresh_accounts();
+        self.show_page("unlock");
+    }
+
+    fn switch_account(self: &Rc<Self>, id: &str) {
+        if self.account.borrow().as_ref().map(Account::id).as_deref() == Some(id) {
+            return self.refresh_accounts();
+        }
+        let Some(account) = store::accounts().into_iter().find(|a| a.id() == id) else {
+            return;
+        };
+        // One account is unlocked at a time.
+        self.lock();
+        self.cancel_two_factor();
+        let email = account.email.clone();
+        self.use_account(account);
+        self.toast(&format!("Switched to {email}"));
+    }
+
+    fn add_account(self: &Rc<Self>) {
+        if store::accounts().len() >= store::MAX_ACCOUNTS {
+            return self.toast(&format!(
+                "Vord keeps up to {} accounts. Log out of one to add another.",
+                store::MAX_ACCOUNTS
+            ));
+        }
+        self.lock();
+        self.cancel_two_factor();
+        let server = self
+            .account
+            .borrow()
+            .as_ref()
+            .map(|a| a.server.clone())
+            .unwrap_or_default();
+        self.login.prefill(&server, "");
+        self.login.set_adding(self.account.borrow().is_some());
+        self.show_page("login");
+    }
+
+    /// Back from adding an account to the one in use.
+    fn cancel_add_account(self: &Rc<Self>) {
+        self.cancel_two_factor();
+        if self.account.borrow().is_some() {
+            self.login.set_adding(false);
+            self.show_page("unlock");
+        }
     }
 
     /// The pending login, if `pending` is still it.
@@ -575,9 +694,11 @@ impl Ui {
     /// PIN unlock stays on.
     fn drop_pin_seal(&self) {
         self.pin_sealed.replace(None);
-        let mut state = store::load_pin();
-        if state.sealed.take().is_some() {
-            store::save_pin(&state);
+        if let Some(account) = self.account.borrow().as_ref() {
+            let mut state = store::load_pin(account);
+            if state.sealed.take().is_some() {
+                store::save_pin(account, &state);
+            }
         }
         self.unlock.set_pin_available(false);
     }
@@ -585,28 +706,33 @@ impl Ui {
     /// After the master password: let the PIN open the vault again, when
     /// PIN unlock is on.
     fn rearm_pin(self: &Rc<Self>, user_key: SymmetricKey) {
-        let Some(encrypted_pin) = store::load_pin().pin else {
-            return;
-        };
         let Some(account) = self.account.borrow().clone() else {
             return;
         };
+        let Some(encrypted_pin) = store::load_pin(&account).pin else {
+            return;
+        };
         let ui = self.clone();
+        let epoch = self.epoch.get();
         glib::spawn_future_local(async move {
+            let sealing = account.clone();
             let sealed = gio::spawn_blocking(move || {
-                session::reseal_with_pin(&account, &encrypted_pin, &user_key)
+                session::reseal_with_pin(&sealing, &encrypted_pin, &user_key)
             })
             .await
             .unwrap_or_else(|_| Err(session::Error::Other("Sealing crashed.".into())));
             match sealed {
-                // A PIN turned off meanwhile stays off.
-                Ok(sealed) if store::load_pin().pin.is_some() => {
-                    let mut state = store::load_pin();
+                // A PIN turned off meanwhile stays off; another account's
+                // seal isn't this one's.
+                Ok(sealed) if store::load_pin(&account).pin.is_some() => {
+                    let mut state = store::load_pin(&account);
                     if state.keep {
                         state.sealed = Some(sealed.clone());
-                        store::save_pin(&state);
+                        store::save_pin(&account, &state);
                     }
-                    ui.pin_sealed.replace(Some(sealed));
+                    if ui.epoch.get() == epoch {
+                        ui.pin_sealed.replace(Some(sealed));
+                    }
                 }
                 Ok(_) => {}
                 Err(error) => log::warn!("could not turn PIN unlock back on: {error}"),
@@ -627,19 +753,23 @@ impl Ui {
         let ui = self.clone();
         glib::spawn_future_local(async move {
             let pin = zeroize::Zeroizing::new(pin);
+            let sealing = account.clone();
             let result = gio::spawn_blocking(move || {
-                let sealed = session::seal_with_pin(&account, &pin, &user_key)?;
+                let sealed = session::seal_with_pin(&sealing, &pin, &user_key)?;
                 Ok::<_, session::Error>((sealed, user_key.encrypt_text(&pin)))
             })
             .await
             .unwrap_or_else(|_| Err(session::Error::Other("Sealing crashed.".into())));
             match result {
                 Ok((sealed, encrypted_pin)) if ui.epoch.get() == epoch => {
-                    store::save_pin(&store::PinState {
-                        pin: Some(encrypted_pin),
-                        sealed: keep.then(|| sealed.clone()),
-                        keep,
-                    });
+                    store::save_pin(
+                        &account,
+                        &store::PinState {
+                            pin: Some(encrypted_pin),
+                            sealed: keep.then(|| sealed.clone()),
+                            keep,
+                        },
+                    );
                     ui.pin_sealed.replace(Some(sealed));
                     ui.pin_attempts.set(0);
                     ui.unlock.set_pin_available(true);
@@ -658,13 +788,18 @@ impl Ui {
 
     pub fn clear_pin(&self) {
         self.pin_sealed.replace(None);
-        store::save_pin(&store::PinState::default());
+        if let Some(account) = self.account.borrow().as_ref() {
+            store::save_pin(account, &store::PinState::default());
+        }
         self.unlock.set_pin_available(false);
     }
 
     /// Keep PIN unlock across restarts (the sealed key on disk) or not.
     pub fn keep_pin(&self, keep: bool) {
-        let mut state = store::load_pin();
+        let Some(account) = self.account.borrow().clone() else {
+            return;
+        };
+        let mut state = store::load_pin(&account);
         if state.pin.is_none() {
             return;
         }
@@ -674,7 +809,7 @@ impl Ui {
         } else {
             None
         };
-        store::save_pin(&state);
+        store::save_pin(&account, &state);
     }
 
     /// Unlocked: show what's cached at once, then sync.
@@ -734,7 +869,7 @@ impl Ui {
             let result = gio::spawn_blocking(move || {
                 // An unchanged vault isn't redrawn: that would hide revealed
                 // secrets and lose the scroll position every ten minutes.
-                let before = store::load_vault();
+                let before = store::load_vault(&account);
                 let (account, sync) = session::sync(account)?;
                 let unlocked = (before.as_ref() != Some(&sync))
                     .then(|| session::open_sync(&account, user_key, &sync));
@@ -818,9 +953,15 @@ impl Ui {
     }
 
     fn confirm_logout(self: &Rc<Self>) {
+        let email = self
+            .account
+            .borrow()
+            .as_ref()
+            .map(|a| a.email.clone())
+            .unwrap_or_default();
         let dialog = adw::AlertDialog::new(
             Some("Log Out?"),
-            Some("Vord forgets this account and its offline copy of the vault. You'll need your master password to log in again."),
+            Some(&format!("Vord forgets {email} and its offline copy of the vault. You'll need the master password to log in again. Other accounts stay.")),
         );
         dialog.add_responses(&[("cancel", "_Cancel"), ("logout", "_Log Out")]);
         dialog.set_response_appearance("logout", adw::ResponseAppearance::Destructive);
@@ -831,18 +972,31 @@ impl Ui {
         dialog.present(Some(&self.window));
     }
 
+    /// Log out of the account in use; another kept account takes over.
     fn logout(self: &Rc<Self>) {
         self.lock();
-        store::forget();
+        let Some(account) = self.account.take() else {
+            return;
+        };
+        store::forget(&account);
         agent::forget(self);
         self.pin_sealed.replace(None);
+        self.pin_stash.borrow_mut().remove(&account.id());
         self.pin_attempts.set(0);
         self.unlock.set_pin_available(false);
-        if let Some(account) = self.account.take() {
-            self.login.prefill(&account.server, &account.email);
+        match store::accounts().into_iter().next() {
+            Some(next) => {
+                self.use_account(next);
+                self.toast(&format!("Logged out of {}", account.email));
+            }
+            None => {
+                self.login.prefill(&account.server, &account.email);
+                self.login.set_adding(false);
+                self.refresh_accounts();
+                self.show_page("login");
+                self.toast("Logged out");
+            }
         }
-        self.show_page("login");
-        self.toast("Logged out");
     }
 
     /// Run `then` once the master password has been re-entered for an item
@@ -1909,6 +2063,23 @@ impl Ui {
             self.window.add_action(&new_send);
         }
         action("logout", &[], |ui| ui.confirm_logout());
+        action("add-account", &[], |ui| ui.add_account());
+        action("cancel-add-account", &[], |ui| ui.cancel_add_account());
+        {
+            let switch = gio::SimpleAction::new_stateful(
+                "switch-account",
+                Some(glib::VariantTy::STRING),
+                &String::new().to_variant(),
+            );
+            let weak = Rc::downgrade(self);
+            switch.connect_activate(move |_, id| {
+                let (Some(ui), Some(id)) = (weak.upgrade(), id.and_then(|v| v.str())) else {
+                    return;
+                };
+                ui.switch_account(id);
+            });
+            self.window.add_action(&switch);
+        }
         action("preferences", &["<Control>comma"], prefs::show);
         action("about", &[], |ui| ui.show_about());
     }

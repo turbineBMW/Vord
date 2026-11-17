@@ -65,6 +65,11 @@ pub enum Quick {
 
 pub struct VaultView {
     pub root: adw::OverlaySplitView,
+    /// The accounts, one item each (a radio of `win.switch-account`).
+    pub accounts: gio::Menu,
+    /// The accounts and "Add Account…": the main menu's submenu, and the
+    /// lock screen's switcher.
+    pub switcher: gio::Menu,
     inner: adw::NavigationSplitView,
     sidebar_list: gtk::ListBox,
     sidebar_rows: RefCell<Vec<Option<Filter>>>,
@@ -140,6 +145,12 @@ impl VaultView {
             .show_end_title_buttons(false)
             .build();
         sidebar_header.pack_start(&header_toggle(&root));
+        let accounts = gio::Menu::new();
+        let switcher = gio::Menu::new();
+        switcher.append_section(None, &accounts);
+        let adding = gio::Menu::new();
+        adding.append(Some("_Add Account…"), Some("win.add-account"));
+        switcher.append_section(None, &adding);
         let menu = gtk::gio::Menu::new();
         let section = gtk::gio::Menu::new();
         section.append(Some("_Generator"), Some("win.generator"));
@@ -153,6 +164,7 @@ impl VaultView {
         section.append(Some("_About Vord"), Some("win.about"));
         menu.append_section(None, &section);
         let section = gtk::gio::Menu::new();
+        section.append_submenu(Some("A_ccounts"), &switcher);
         section.append(Some("Log _Out…"), Some("win.logout"));
         menu.append_section(None, &section);
         sidebar_header.pack_end(
@@ -410,6 +422,8 @@ impl VaultView {
 
         Self {
             root,
+            accounts,
+            switcher,
             inner,
             sidebar_list,
             sidebar_rows: RefCell::new(Vec::new()),

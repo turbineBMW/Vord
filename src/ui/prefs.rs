@@ -265,7 +265,12 @@ fn agent_group(ui: &Rc<Ui>, current: &settings::Settings) -> adw::PreferencesGro
 /// Unlock with PIN: turning it on asks for the PIN; keeping it across
 /// restarts puts the sealed key on disk.
 fn pin_group(ui: &Rc<Ui>, prefs: &adw::PreferencesDialog) -> adw::PreferencesGroup {
-    let state = crate::store::load_pin();
+    let state = ui
+        .account
+        .borrow()
+        .as_ref()
+        .map(crate::store::load_pin)
+        .unwrap_or_default();
     let group = adw::PreferencesGroup::builder()
         .title("PIN")
         .description("Five wrong PINs in a row, and the master password is needed again.")

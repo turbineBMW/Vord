@@ -36,7 +36,10 @@ src/session.rs   login (Done | SecondStep(PendingLogin)) / second_step / unlock_
                  open_sync / change (save, favorite, trash, restore, purge, folders,
                  attachments, Sends):
                  blocking, run on workers; `change` folds the answer into vault.json
-src/store.rs     account.json + vault.json (still encrypted) in $XDG_DATA_HOME/vord, 0600;
+src/store.rs     per account, in $XDG_DATA_HOME/vord/accounts/<id>/ (id from server +
+                 email; `active` names the one in use; older top-level files move in):
+                 account.json + vault.json (still encrypted), 0600; every call names
+                 its account, and saves skip one that was logged out of meanwhile;
                  pin.json (the PIN sealed by the user key, and the user key sealed by
                  the PIN's key only if kept across restarts; apart from account.json,
                  which a sync rewrites from an older copy);
