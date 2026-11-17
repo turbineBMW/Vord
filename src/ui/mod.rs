@@ -12,6 +12,7 @@
 //! the vault was locked again is dropped (see [`Ui::epoch`]).
 
 mod detail;
+mod generator;
 mod pages;
 mod prefs;
 mod vault;
@@ -40,6 +41,8 @@ const AUTO_SYNC: Duration = Duration::from_secs(10 * 60);
 /// the view that shows it.
 pub struct Session {
     pub keys: Keys,
+    /// What was copied from the generator, oldest first.
+    pub generated: Vec<generator::Generated>,
 }
 
 pub struct Ui {
@@ -63,6 +66,8 @@ pub struct Ui {
     /// The reprompt item whose secrets the master password was re-entered
     /// for. Cleared when another item is shown.
     reprompt_passed: RefCell<Option<String>>,
+    /// The generator dialog, while it's open.
+    generator: RefCell<Option<adw::Dialog>>,
 }
 
 pub fn build(app: &adw::Application) -> Rc<Ui> {
@@ -107,6 +112,7 @@ pub fn build(app: &adw::Application) -> Rc<Ui> {
         lock_timer: RefCell::new(None),
         sync_timer: RefCell::new(None),
         reprompt_passed: RefCell::new(None),
+        generator: RefCell::new(None),
     });
     ui.login.connect(&ui);
     ui.two_factor.connect(&ui);
@@ -160,6 +166,7 @@ impl Ui {
         for action in [
             "lock",
             "sync",
+            "generator",
             "search",
             "copy-username",
             "copy-password",
@@ -408,7 +415,10 @@ impl Ui {
     fn opened(self: &Rc<Self>, keys: Keys, vault: Option<Vault>) {
         let have_cache = vault.is_some();
         let vault = Rc::new(vault.unwrap_or_else(empty_vault));
-        self.session.replace(Some(Session { keys }));
+        self.session.replace(Some(Session {
+            keys,
+            generated: Vec::new(),
+        }));
         UNLOCKED.with(|u| u.set(true));
         self.vault.show_vault(self, vault, !have_cache);
         self.show_page("vault");
@@ -474,9 +484,11 @@ impl Ui {
                 Ok((account, Some(unlocked))) => {
                     ui.account.replace(Some(account));
                     let vault = Rc::new(unlocked.vault);
-                    ui.session.replace(Some(Session {
-                        keys: unlocked.keys,
-                    }));
+                    // New keys (a rotated key, a new organization); the
+                    // rest of the session stays.
+                    if let Some(session) = ui.session.borrow_mut().as_mut() {
+                        session.keys = unlocked.keys;
+                    }
                     ui.vault.show_vault(&ui, vault, false);
                 }
                 Err(session::Error::Api(crate::api::ApiError::SessionExpired)) => {
@@ -500,6 +512,9 @@ impl Ui {
         }
         self.epoch.set(self.epoch.get() + 1);
         self.vault.clear();
+        if let Some(dialog) = self.generator.take() {
+            dialog.force_close();
+        }
         self.session.replace(None);
         UNLOCKED.with(|u| u.set(false));
         self.reprompt_passed.replace(None);
@@ -669,6 +684,7 @@ impl Ui {
         action("open-website", &["<Control>o"], |ui| {
             ui.vault.copy_field(ui, vault::Quick::Website)
         });
+        action("generator", &["<Control>g"], generator::show);
         action("logout", &[], |ui| ui.confirm_logout());
         action("preferences", &["<Control>comma"], prefs::show);
         action("about", &[], |ui| ui.show_about());

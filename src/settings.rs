@@ -20,6 +20,8 @@ pub struct Settings {
     /// What the login page fills in next time.
     pub last_server: String,
     pub last_email: String,
+    /// The generator's options (never what it made).
+    pub generator: crate::generator::Options,
 }
 
 impl Default for Settings {
@@ -32,6 +34,7 @@ impl Default for Settings {
             clear_clipboard_seconds: 30,
             last_server: String::new(),
             last_email: String::new(),
+            generator: crate::generator::Options::default(),
         }
     }
 }

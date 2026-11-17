@@ -2,6 +2,7 @@ mod accent;
 mod api;
 mod clipboard;
 mod crypto;
+mod generator;
 mod icons;
 mod omarchy;
 mod screenlock;
@@ -24,8 +25,9 @@ fn main() -> anyhow::Result<()> {
     match args.get(1).map(String::as_str) {
         Some("login") => cli_login(&args[2..]),
         Some("list") => cli_list(),
+        Some("generate") => cli_generate(&args[2..]),
         Some("--help" | "-h" | "help") => {
-            println!("Vord {}: a Bitwarden / Vaultwarden vault for the desktop.\n\n  vord                     open the app\n  vord login SERVER EMAIL [--method authenticator|email|yubikey] [--remember]\n                           log in (master password, then any code, on stdin)\n  vord list                unlock, sync and list items (master password on stdin)", env!("CARGO_PKG_VERSION"));
+            println!("Vord {}: a Bitwarden / Vaultwarden vault for the desktop.\n\n  vord                     open the app\n  vord login SERVER EMAIL [--method authenticator|email|yubikey] [--remember]\n                           log in (master password, then any code, on stdin)\n  vord list                unlock, sync and list items (master password on stdin)\n  vord generate [password|passphrase|username]\n                           make one with the generator's saved options", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
         _ => {
@@ -161,6 +163,32 @@ fn cli_login(args: &[String]) -> anyhow::Result<()> {
         }
     };
     println!("logged in as {} on {}", account.email, account.server);
+    Ok(())
+}
+
+/// `vord generate [KIND]`: one value, with the options the generator
+/// dialog last used.
+fn cli_generate(args: &[String]) -> anyhow::Result<()> {
+    use generator::Kind;
+    let options = settings::Settings::load().generator;
+    let kind = match args.first().map(String::as_str) {
+        None => options.kind,
+        Some("password") => Kind::Password,
+        Some("passphrase") => Kind::Passphrase,
+        Some("username") => Kind::Username,
+        Some(other) => anyhow::bail!(
+            "unknown kind {other}\nusage: vord generate [password|passphrase|username]"
+        ),
+    };
+    let value = match kind {
+        Kind::Password => generator::password(&options.password),
+        Kind::Passphrase => generator::passphrase(&options.passphrase),
+        Kind::Username => {
+            let email = store::Account::load().map(|a| a.email).unwrap_or_default();
+            generator::username(&options.username, &email).map_err(anyhow::Error::msg)?
+        }
+    };
+    println!("{value}");
     Ok(())
 }
 

@@ -28,26 +28,53 @@ Omarchy theme live.
 - Works offline: unlocking needs no network. The vault syncs on unlock, every
   10 minutes and with Ctrl+R.
 - Organization items, including per-item keys.
+- A generator for passwords, passphrases and usernames (random word,
+  plus-addressed or catch-all email), with Bitwarden's options. What you copy
+  from it is listed under History until the vault locks; `vord generate` makes
+  one from the terminal.
 - Two-step login with an authenticator app, an emailed code or a YubiKey
   (OTP), and "remember this device".
 
-Vord is read-only for now. Edit items in the web vault or another Bitwarden
-app, and Vord picks the change up on its next sync.
+Vord is read-only for now; editing is next on the [roadmap](#roadmap).
 
-### Not yet
+## Roadmap
 
-- Creating or editing items, and a password generator.
-- Two-step login with Duo or a FIDO2 security key. An account that has only
-  those gets a clear error at login; one that also has an authenticator app or
-  email can use those.
-- Downloading attachments. Their names are shown.
-- SSO and Key Connector accounts.
+The aim is to do what the Bitwarden desktop app does, in this order:
+
+1. ~~Two-step login with an authenticator app, email or a YubiKey.~~ Done.
+2. ~~Password, passphrase and username generator.~~ Done.
+3. Creating and editing items: every item type, folders, favorites, moving
+   items between folders and organizations, cloning, deleting to the Trash
+   and restoring from it, and each item's password history. Fields Vord
+   doesn't show yet (passkeys, attachments, anything newer) are kept as they
+   are when an item is saved.
+4. Attachments: downloading and uploading them.
+5. Sends: sharing text and files by link.
+6. Unlocking with a PIN, exporting the vault, syncing the moment something
+   changes on the server, an SSH agent for the vault's SSH keys, more than
+   one account, and a tray icon.
+7. Two-step login with Duo or a FIDO2 security key, logging in by approving
+   from another device, and SSO.
+
+Until then:
+
+- Edit items in the web vault or another Bitwarden app; Vord picks the change
+  up on its next sync.
+- Attachments are listed by name but can't be opened.
+- An account whose only second step is Duo or a FIDO2 key gets a clear error
+  at login; one that also has an authenticator app or email can use those.
+- SSO and Key Connector accounts can't log in.
+
+Not on the list yet: forwarded email aliases (SimpleLogin, addy.io and the
+like) in the username generator, auto-type, and unlocking browser extensions
+with Vord.
 
 ## Keyboard
 
 | Key | Action |
 | --- | --- |
 | Ctrl+F | Search |
+| Ctrl+G | Generator |
 | Ctrl+U | Copy the username |
 | Ctrl+P | Copy the password |
 | Ctrl+T | Copy the verification code |
@@ -109,3 +136,7 @@ translucent:
 ## Licence
 
 GPL-3.0-or-later.
+
+Passphrases and usernames use the [EFF long word list](https://www.eff.org/dice)
+(`data/eff_large_wordlist.txt`), by the Electronic Frontier Foundation, under
+CC BY 3.0 US.
