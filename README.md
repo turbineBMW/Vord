@@ -40,6 +40,9 @@ Omarchy theme live.
   an organization's items between its collections. A new SSH key item gets a freshly made Ed25519 key.
 - A changed password goes into the item's password history (the last five,
   shown under the item), as do a hidden field's old values.
+- Attachments: save one where you choose, add files to an item, delete
+  them. Each file is encrypted with a key of its own, as Bitwarden's apps
+  do.
 - Cloning, moving to the Trash, restoring and deleting for good; creating,
   renaming and deleting folders.
 - Saving changes only what you changed. Passkeys, attachments and anything
@@ -55,7 +58,7 @@ The aim is to do what the Bitwarden desktop app does, in this order:
 3. ~~Creating and editing items: every item type, folders, favorites,
    cloning, the Trash, password history, moving items into an organization
    and between its collections.~~ Done.
-4. Attachments: downloading and uploading them.
+4. ~~Attachments: downloading and uploading them.~~ Done.
 5. Sends: sharing text and files by link.
 6. Unlocking with a PIN, exporting the vault, syncing the moment something
    changes on the server, an SSH agent for the vault's SSH keys, more than
@@ -65,7 +68,6 @@ The aim is to do what the Bitwarden desktop app does, in this order:
 
 Until then:
 
-- Attachments are listed by name but can't be opened.
 - An account whose only second step is Duo or a FIDO2 key gets a clear error
   at login; one that also has an authenticator app or email can use those.
 - SSO and Key Connector accounts can't log in.
@@ -114,6 +116,8 @@ Vord follows the Bitwarden client protocol and does all decryption locally:
   one, before they're sent. Fields you didn't change keep their ciphertext.
   Websites carry the checksum Bitwarden's apps use to notice a URI swapped
   by a server.
+- The one decrypted thing Vord writes is an attachment you save, to the
+  place you pick.
 - Keys are zeroed when the vault locks, and every widget that showed
   decrypted text is destroyed, including an editor with unsaved changes.
 

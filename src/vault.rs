@@ -278,6 +278,14 @@ pub struct Field {
     pub kind: FieldKind,
 }
 
+#[derive(Clone)]
+pub struct Attachment {
+    pub id: String,
+    pub name: String,
+    /// "1.2 MB", as the server puts it.
+    pub size: Option<String>,
+}
+
 /// A password the item had before, or a hidden field's earlier value
 /// ("name: value").
 #[derive(Clone)]
@@ -306,7 +314,7 @@ pub struct Item {
     pub identity: Option<Identity>,
     pub ssh_key: Option<SshKey>,
     pub fields: Vec<Field>,
-    pub attachments: Vec<String>,
+    pub attachments: Vec<Attachment>,
     /// Newest first.
     pub password_history: Vec<PastPassword>,
     /// Some field would not decrypt; what showed is what opened.
@@ -642,9 +650,14 @@ fn open_item(cipher: &Value, keys: &Keys) -> Option<Item> {
 
     let attachments = array(cipher.get("attachments"))
         .iter()
-        .map(|a| {
-            open.text(a, "fileName")
-                .unwrap_or_else(|| "Attachment".into())
+        .filter_map(|a| {
+            Some(Attachment {
+                id: str_at(a, "id")?.to_string(),
+                name: open
+                    .text(a, "fileName")
+                    .unwrap_or_else(|| "Attachment".into()),
+                size: str_at(a, "sizeName").map(str::to_string),
+            })
         })
         .collect();
 

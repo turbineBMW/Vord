@@ -212,7 +212,7 @@ impl SymmetricKey {
         }
     }
 
-    #[cfg(test)]
+    /// A new random key, for an attachment (or a test).
     pub fn generate() -> Self {
         use rand::RngCore;
         let mut bytes = Zeroizing::new([0u8; 64]);
@@ -230,7 +230,44 @@ impl SymmetricKey {
         self.encrypt(plain.as_bytes()).to_string()
     }
 
-    #[cfg(test)]
+    /// Encrypt a file the way Bitwarden stores attachments: the type byte
+    /// (2), the IV, the MAC, then the ciphertext.
+    pub fn encrypt_file(&self, plain: &[u8]) -> Vec<u8> {
+        let EncString::AesCbc256HmacSha256 { iv, data, mac } = self.encrypt(plain) else {
+            unreachable!("encrypt makes type 2");
+        };
+        let mut out = Vec::with_capacity(1 + iv.len() + mac.len() + data.len());
+        out.push(2);
+        out.extend_from_slice(&iv);
+        out.extend_from_slice(&mac);
+        out.extend_from_slice(&data);
+        out
+    }
+
+    /// Decrypt an attachment file (see [`Self::encrypt_file`]; legacy files
+    /// are type 0, IV then ciphertext).
+    pub fn decrypt_file(&self, bytes: &[u8]) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
+        let iv = |at: usize| -> [u8; 16] { bytes[at..at + 16].try_into().expect("16 bytes") };
+        let enc = match bytes.first() {
+            Some(2) if bytes.len() > 49 => EncString::AesCbc256HmacSha256 {
+                iv: iv(1),
+                mac: bytes[17..49].try_into().expect("32 bytes"),
+                data: bytes[49..].to_vec(),
+            },
+            Some(0) if bytes.len() > 17 => EncString::AesCbc256 {
+                iv: iv(1),
+                data: bytes[17..].to_vec(),
+            },
+            _ => {
+                return Err(CryptoError::Format(
+                    "an attachment file Vord can't read".into(),
+                ))
+            }
+        };
+        enc.decrypt(self)
+    }
+
+    /// The key's bytes, to seal it with another key.
     pub fn to_bytes(&self) -> Zeroizing<Vec<u8>> {
         let mut out = Zeroizing::new(self.enc.to_vec());
         if let Some(mac) = &self.mac {
@@ -413,6 +450,20 @@ impl EncString {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn files_round_trip() {
+        let key = SymmetricKey::generate();
+        let plain = b"%PDF-1.7 not really".repeat(100);
+        let sealed = key.encrypt_file(&plain);
+        assert_eq!(sealed[0], 2);
+        assert_eq!(sealed.len(), 1 + 16 + 32 + (plain.len() / 16 + 1) * 16);
+        assert_eq!(*key.decrypt_file(&sealed).unwrap(), plain);
+        let mut tampered = sealed.clone();
+        *tampered.last_mut().unwrap() ^= 1;
+        assert_eq!(key.decrypt_file(&tampered), Err(CryptoError::Mac));
+        assert!(key.decrypt_file(&[2, 0, 0]).is_err());
+    }
 
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
