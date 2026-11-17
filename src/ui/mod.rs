@@ -11,6 +11,7 @@
 //! is the only place state and widgets change. A result that arrives after
 //! the vault was locked again is dropped (see [`Ui::epoch`]).
 
+mod agent;
 mod detail;
 mod editor;
 mod export;
@@ -104,6 +105,14 @@ pub struct Ui {
     live_sync_due: Cell<bool>,
     /// A sync was asked for while one was running.
     sync_again: Cell<bool>,
+    /// The SSH agent's stop switch, while it listens.
+    agent: RefCell<Option<Arc<std::sync::atomic::AtomicBool>>>,
+    /// The SSH keys it offers (public halves only).
+    agent_keys: RefCell<Vec<agent::AgentKey>>,
+    /// Items whose keys may sign without asking, until the vault locks.
+    agent_allowed: RefCell<std::collections::HashSet<String>>,
+    /// Requests to sign that wait for the vault to be unlocked.
+    agent_waiting: RefCell<Vec<agent::Waiting>>,
 }
 
 /// Wrong PINs allowed before the master password is needed.
@@ -161,6 +170,10 @@ pub fn build(app: &adw::Application) -> Rc<Ui> {
         live_retry: RefCell::new(None),
         live_sync_due: Cell::new(false),
         sync_again: Cell::new(false),
+        agent: RefCell::new(None),
+        agent_keys: RefCell::new(Vec::new()),
+        agent_allowed: RefCell::new(Default::default()),
+        agent_waiting: RefCell::new(Vec::new()),
     });
     LIVE_UI.with(|w| w.replace(Rc::downgrade(&ui)));
     ui.login.connect(&ui);
@@ -169,6 +182,7 @@ pub fn build(app: &adw::Application) -> Rc<Ui> {
     ui.vault.connect(&ui);
     ui.add_actions(app);
     ui.watch_focus();
+    agent::start(&ui);
     crate::sidebar::sync(&ui.window);
     {
         let weak = Rc::downgrade(&ui);
@@ -659,6 +673,7 @@ impl Ui {
         self.sync();
         self.live_failures.set(0);
         self.start_live();
+        agent::unlocked(self);
         let weak = Rc::downgrade(self);
         let timer = glib::timeout_add_local(AUTO_SYNC, move || match weak.upgrade() {
             Some(ui) if ui.is_unlocked() => {
@@ -758,6 +773,7 @@ impl Ui {
         self.epoch.set(self.epoch.get() + 1);
         self.stop_live();
         self.sync_again.set(false);
+        agent::locked(self);
         self.vault.clear();
         if let Some(dialog) = self.generator.take() {
             dialog.force_close();
@@ -798,6 +814,7 @@ impl Ui {
     fn logout(self: &Rc<Self>) {
         self.lock();
         store::forget();
+        agent::forget(self);
         self.pin_sealed.replace(None);
         self.pin_attempts.set(0);
         self.unlock.set_pin_available(false);

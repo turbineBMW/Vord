@@ -604,6 +604,7 @@ impl VaultView {
     /// still exist.
     pub fn show_vault(&self, ui: &Rc<Ui>, vault: Rc<Vault>, loading: bool) {
         self.banner.set_revealed(false);
+        super::agent::refresh_keys(ui, &vault);
         self.vault.replace(Some(vault));
         self.rebuild_sidebar(ui);
         self.rebuild_items(ui);

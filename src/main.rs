@@ -1,4 +1,5 @@
 mod accent;
+mod agent;
 mod api;
 mod clipboard;
 mod crypto;

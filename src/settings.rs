@@ -22,6 +22,11 @@ pub struct Settings {
     pub last_email: String,
     /// The generator's options (never what it made).
     pub generator: crate::generator::Options,
+    /// Serve the vault's SSH keys on an agent socket.
+    pub ssh_agent: bool,
+    /// When the agent asks before a key is used: 0 every time, 1 once per
+    /// key until the vault locks, 2 never.
+    pub ssh_agent_ask: u32,
 }
 
 impl Default for Settings {
@@ -35,6 +40,8 @@ impl Default for Settings {
             last_server: String::new(),
             last_email: String::new(),
             generator: crate::generator::Options::default(),
+            ssh_agent: false,
+            ssh_agent_ask: 0,
         }
     }
 }

@@ -35,7 +35,10 @@ rand = "0.8"
 # Live sync: the notifications hub is SignalR over a websocket, in MessagePack.
 tungstenite = { version = "0.30", default-features = false, features = ["handshake", "rustls-tls-native-roots"] }
 rmpv = "1"
-ssh-key = { version = "0.6", default-features = false, features = ["ed25519", "rand_core", "std", "alloc"] }
+ssh-key = { version = "0.6", default-features = false, features = ["ed25519", "rsa", "p256", "p384", "p521", "rand_core", "std", "alloc"] }
+ssh-encoding = { version = "0.2", features = ["alloc"] }
+# The SSH agent asks the kernel who's connecting (SO_PEERCRED).
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
