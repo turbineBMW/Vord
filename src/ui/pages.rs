@@ -470,6 +470,12 @@ pub struct UnlockPage {
     pub root: adw::ToolbarView,
     who: gtk::Label,
     password: adw::PasswordEntryRow,
+    pin: adw::PasswordEntryRow,
+    /// Between the PIN and the master password.
+    switch: gtk::Button,
+    /// Whether the PIN is asked for (it can be, and the user hasn't
+    /// switched to the master password).
+    pin_mode: std::cell::Cell<bool>,
     button: gtk::Button,
     spinner: adw::Spinner,
     label: gtk::Label,
@@ -490,6 +496,18 @@ impl UnlockPage {
             .title("Master password")
             .build();
         group.add(&password);
+        let pin = adw::PasswordEntryRow::builder()
+            .title("PIN")
+            .visible(false)
+            .build();
+        group.add(&pin);
+        let switch = gtk::Button::builder()
+            .label("Use Master Password")
+            .css_classes(["flat"])
+            .halign(gtk::Align::Center)
+            .margin_top(6)
+            .visible(false)
+            .build();
         let (button, spinner, label) = action_button("Unlock");
         let error = error_label();
         let logout = gtk::Button::builder()
@@ -505,11 +523,15 @@ impl UnlockPage {
         column.append(&group);
         column.append(&error);
         column.append(&button);
+        column.append(&switch);
         column.append(&logout);
         Self {
             root: frame(&column),
             who,
             password,
+            pin,
+            switch,
+            pin_mode: std::cell::Cell::new(false),
             button,
             spinner,
             label,
@@ -526,12 +548,44 @@ impl UnlockPage {
                     return;
                 }
                 ui.unlock.error.set_visible(false);
-                ui.unlock(ui.unlock.password.text().to_string());
+                if ui.unlock.pin_mode.get() {
+                    ui.unlock_with_pin(ui.unlock.pin.text().to_string());
+                } else {
+                    ui.unlock(ui.unlock.password.text().to_string());
+                }
             }
         });
         let s = submit.clone();
         self.button.connect_clicked(move |_| s());
-        self.password.connect_entry_activated(move |_| submit());
+        let s = submit.clone();
+        self.password.connect_entry_activated(move |_| s());
+        self.pin.connect_entry_activated(move |_| submit());
+        let weak = Rc::downgrade(ui);
+        self.switch.connect_clicked(move |_| {
+            if let Some(ui) = weak.upgrade() {
+                let page = &ui.unlock;
+                page.show_mode(!page.pin_mode.get());
+                page.error.set_visible(false);
+                page.focus();
+            }
+        });
+    }
+
+    /// Ask for the PIN when it can open the vault, else the master password.
+    pub fn set_pin_available(&self, available: bool) {
+        self.switch.set_visible(available);
+        self.show_mode(available);
+    }
+
+    fn show_mode(&self, pin: bool) {
+        self.pin_mode.set(pin);
+        self.pin.set_visible(pin);
+        self.password.set_visible(!pin);
+        self.switch.set_label(if pin {
+            "Use Master Password"
+        } else {
+            "Use PIN"
+        });
     }
 
     pub fn show_account(&self, account: &Account) {
@@ -540,12 +594,18 @@ impl UnlockPage {
     }
 
     pub fn focus(&self) {
-        self.password.grab_focus();
+        if self.pin_mode.get() {
+            self.pin.grab_focus();
+        } else {
+            self.password.grab_focus();
+        }
     }
 
     pub fn set_busy(&self, busy: bool) {
         self.button.set_sensitive(!busy);
         self.password.set_sensitive(!busy);
+        self.pin.set_sensitive(!busy);
+        self.switch.set_sensitive(!busy);
         self.spinner.set_visible(busy);
         self.label
             .set_label(if busy { "Unlocking…" } else { "Unlock" });
@@ -554,12 +614,18 @@ impl UnlockPage {
     pub fn fail(&self, message: &str) {
         self.error.set_label(message);
         self.error.set_visible(true);
-        self.password.grab_focus();
-        self.password.select_region(0, -1);
+        let entry = if self.pin_mode.get() {
+            &self.pin
+        } else {
+            &self.password
+        };
+        entry.grab_focus();
+        entry.select_region(0, -1);
     }
 
     pub fn clear_password(&self) {
         self.password.set_text("");
+        self.pin.set_text("");
         self.error.set_visible(false);
     }
 }

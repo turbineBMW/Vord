@@ -96,7 +96,7 @@ pub fn row(send: &Send) -> gtk::ListBoxRow {
     );
     let subtitle = match (closed(send), send.deletes.as_deref().and_then(when)) {
         (Some(why), _) => Some(why.to_string()),
-        (None, Some(date)) => Some(format!("Deleted {date}")),
+        (None, Some(date)) => Some(format!("Deletes {date}")),
         (None, None) => None,
     };
     if let Some(subtitle) = subtitle {
@@ -300,7 +300,7 @@ pub fn detail(ui: &Rc<Ui>, send: &Send) -> gtk::Widget {
     // -- Who can open it, and until when.
     let access = group(&column, "Access");
     if let Some(deletes) = send.deletes.as_deref().and_then(when) {
-        info(&access, "Deleted", &deletes);
+        info(&access, "Deletion date", &deletes);
     }
     let expires = match send.expires.as_deref() {
         Some(iso) => when(iso).map(|w| {
@@ -592,7 +592,7 @@ impl SendEditor {
         // -- Who can open it, and until when.
         let access = group(&column, "Access");
         let deletes = DateChoice::new(
-            "Deleted",
+            "Deletion date",
             draft.deletes.as_deref(),
             false,
             When::In(7 * 24 * 60 * 60),

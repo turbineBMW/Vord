@@ -116,6 +116,9 @@ pub fn show(ui: &Rc<Ui>) {
         |value| settings::update(|s| s.clear_clipboard_seconds = value),
     ));
     page.add(&security);
+    if ui.is_unlocked() {
+        page.add(&pin_group(ui, &dialog));
+    }
 
     if let Some(account) = ui.account.borrow().as_ref() {
         let group = adw::PreferencesGroup::builder().title("Account").build();
@@ -155,6 +158,138 @@ pub fn show(ui: &Rc<Ui>) {
         page.add(&group);
     }
     dialog.present(Some(&ui.window));
+}
+
+/// Unlock with PIN: turning it on asks for the PIN; keeping it across
+/// restarts puts the sealed key on disk.
+fn pin_group(ui: &Rc<Ui>, prefs: &adw::PreferencesDialog) -> adw::PreferencesGroup {
+    let state = crate::store::load_pin();
+    let group = adw::PreferencesGroup::builder()
+        .title("PIN")
+        .description("Five wrong PINs in a row, and the master password is needed again.")
+        .build();
+    let on = adw::SwitchRow::builder()
+        .title("Unlock with PIN")
+        .subtitle("Instead of the master password")
+        .active(state.pin.is_some())
+        .build();
+    let keep = adw::SwitchRow::builder()
+        .title("Keep after a restart")
+        .subtitle("Otherwise the master password is needed once each time Vord starts. Kept on disk, a PIN is only as strong as it is long: someone with a copy of your files could try every one.")
+        .active(state.keep)
+        .sensitive(state.pin.is_some())
+        .build();
+    group.add(&on);
+    group.add(&keep);
+
+    // Set while the switches are moved back from code.
+    let quiet = Rc::new(std::cell::Cell::new(false));
+    let undo = {
+        let (on, keep, quiet) = (on.downgrade(), keep.downgrade(), quiet.clone());
+        move || {
+            let (Some(on), Some(keep)) = (on.upgrade(), keep.upgrade()) else {
+                return;
+            };
+            quiet.set(true);
+            on.set_active(false);
+            keep.set_active(false);
+            keep.set_sensitive(false);
+            quiet.set(false);
+        }
+    };
+    let weak = Rc::downgrade(ui);
+    let prefs = prefs.downgrade();
+    let keep_row = keep.clone();
+    on.connect_active_notify(move |row| {
+        let Some(ui) = weak.upgrade() else { return };
+        if quiet.get() {
+            return;
+        }
+        if !row.is_active() {
+            ui.clear_pin();
+            undo();
+            ui.toast("PIN unlock is off");
+            return;
+        }
+        let (Some(prefs), keep) = (prefs.upgrade(), keep_row.clone()) else {
+            return;
+        };
+        ask_pin(&ui, &prefs, keep, undo.clone());
+    });
+    let weak = Rc::downgrade(ui);
+    keep.connect_active_notify(move |row| {
+        if let Some(ui) = weak.upgrade() {
+            ui.keep_pin(row.is_active());
+        }
+    });
+    group
+}
+
+/// Ask for a new PIN, twice. `undo` turns the switches back off when it's
+/// not set.
+fn ask_pin(
+    ui: &Rc<Ui>,
+    prefs: &adw::PreferencesDialog,
+    keep: adw::SwitchRow,
+    undo: impl Fn() + Clone + 'static,
+) {
+    let pin = adw::PasswordEntryRow::builder().title("PIN").build();
+    let again = adw::PasswordEntryRow::builder()
+        .title("PIN again")
+        .activates_default(true)
+        .build();
+    let list = gtk::ListBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .css_classes(["boxed-list"])
+        .build();
+    list.append(&pin);
+    list.append(&again);
+    let dialog = adw::AlertDialog::new(
+        Some("Set a PIN"),
+        Some("Four or more characters, used only on this computer."),
+    );
+    dialog.set_extra_child(Some(&list));
+    dialog.add_responses(&[("cancel", "_Cancel"), ("set", "_Set PIN")]);
+    dialog.set_response_appearance("set", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("set"));
+    dialog.set_close_response("cancel");
+    dialog.set_response_enabled("set", false);
+    let check = {
+        let (dialog, pin, again) = (dialog.downgrade(), pin.clone(), again.clone());
+        move || {
+            if let Some(dialog) = dialog.upgrade() {
+                let ok = pin.text().chars().count() >= 4 && pin.text() == again.text();
+                dialog.set_response_enabled("set", ok);
+            }
+        }
+    };
+    let check = Rc::new(check);
+    for entry in [&pin, &again] {
+        let check = check.clone();
+        entry.connect_changed(move |_| check());
+    }
+    let weak = Rc::downgrade(ui);
+    let typed = pin.clone();
+    let cancel = undo.clone();
+    dialog.connect_response(None, move |_, response| {
+        if response != "set" {
+            return cancel();
+        }
+        let Some(ui) = weak.upgrade() else {
+            return cancel();
+        };
+        let undo = undo.clone();
+        let keep = keep.clone();
+        ui.set_pin(typed.text().to_string(), keep.is_active(), move |ok| {
+            if ok {
+                keep.set_sensitive(true);
+            } else {
+                undo();
+            }
+        });
+    });
+    dialog.present(Some(prefs));
+    pin.grab_focus();
 }
 
 fn glib_escape(text: &str) -> String {
