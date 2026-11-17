@@ -36,7 +36,19 @@ use std::time::Duration;
 thread_local! {
     /// Mirrors [`Ui::is_unlocked`] for code outside the window.
     pub static UNLOCKED: Cell<bool> = const { Cell::new(false) };
+    /// The window, for the live-sync thread's events to find.
+    static LIVE_UI: RefCell<std::rc::Weak<Ui>> = const { RefCell::new(std::rc::Weak::new()) };
 }
+
+/// What the live-sync thread reports.
+enum LiveNews {
+    Event(crate::live::Event),
+    /// The connection ended, and why when it failed.
+    Ended(Option<String>),
+}
+
+/// Waits between tries to reach the hub again, the last one repeating.
+const LIVE_RETRY: [u64; 4] = [5, 15, 60, 300];
 
 /// How often an unlocked vault syncs on its own.
 const AUTO_SYNC: Duration = Duration::from_secs(10 * 60);
@@ -82,6 +94,16 @@ pub struct Ui {
     /// Wrong PINs since the last unlock; five turn PIN unlock off until the
     /// master password is used.
     pin_attempts: Cell<u8>,
+    /// The live-sync listener: its number and its stop switch.
+    live: RefCell<Option<(u64, crate::live::Stop)>>,
+    live_count: Cell<u64>,
+    /// Failed connections in a row, for the wait before the next.
+    live_failures: Cell<usize>,
+    live_retry: RefCell<Option<glib::SourceId>>,
+    /// A sync is due once a burst of changes settles.
+    live_sync_due: Cell<bool>,
+    /// A sync was asked for while one was running.
+    sync_again: Cell<bool>,
 }
 
 /// Wrong PINs allowed before the master password is needed.
@@ -133,7 +155,14 @@ pub fn build(app: &adw::Application) -> Rc<Ui> {
         dialogs: RefCell::new(Vec::new()),
         pin_sealed: RefCell::new(None),
         pin_attempts: Cell::new(0),
+        live: RefCell::new(None),
+        live_count: Cell::new(0),
+        live_failures: Cell::new(0),
+        live_retry: RefCell::new(None),
+        live_sync_due: Cell::new(false),
+        sync_again: Cell::new(false),
     });
+    LIVE_UI.with(|w| w.replace(Rc::downgrade(&ui)));
     ui.login.connect(&ui);
     ui.two_factor.connect(&ui);
     ui.unlock.connect(&ui);
@@ -628,6 +657,8 @@ impl Ui {
         self.vault.show_vault(self, vault, !have_cache);
         self.show_page("vault");
         self.sync();
+        self.live_failures.set(0);
+        self.start_live();
         let weak = Rc::downgrade(self);
         let timer = glib::timeout_add_local(AUTO_SYNC, move || match weak.upgrade() {
             Some(ui) if ui.is_unlocked() => {
@@ -646,7 +677,12 @@ impl Ui {
     }
 
     pub fn sync(self: &Rc<Self>) {
-        if self.syncing.get() || !self.is_unlocked() {
+        if !self.is_unlocked() {
+            return;
+        }
+        if self.syncing.get() {
+            // It may have fetched before the change it's asked for.
+            self.sync_again.set(true);
             return;
         }
         let Some(account) = self.account.borrow().clone() else {
@@ -674,6 +710,10 @@ impl Ui {
             .unwrap_or_else(|_| Err(session::Error::Other("Syncing crashed.".into())));
             ui.syncing.set(false);
             ui.vault.set_syncing(false);
+            if ui.sync_again.take() {
+                let ui = ui.clone();
+                glib::idle_add_local_once(move || ui.sync());
+            }
             if ui.epoch.get() != epoch || !ui.is_unlocked() {
                 // Locked meanwhile: the account's new tokens still count.
                 if let Ok((account, _)) = result {
@@ -716,6 +756,8 @@ impl Ui {
             return;
         }
         self.epoch.set(self.epoch.get() + 1);
+        self.stop_live();
+        self.sync_again.set(false);
         self.vault.clear();
         if let Some(dialog) = self.generator.take() {
             dialog.force_close();
@@ -1537,6 +1579,124 @@ impl Ui {
         });
     }
 
+    // ---- live sync ----------------------------------------------------
+
+    /// Listen to the server's notifications hub while the vault is
+    /// unlocked; a change made elsewhere then syncs at once.
+    fn start_live(self: &Rc<Self>) {
+        self.stop_live();
+        let Some(account) = self.account.borrow().clone() else {
+            return;
+        };
+        let epoch = self.epoch.get();
+        let ui = self.clone();
+        glib::spawn_future_local(async move {
+            let token = gio::spawn_blocking(move || session::hub_token(account))
+                .await
+                .unwrap_or_else(|_| Err(session::Error::Other("crashed".into())));
+            if ui.epoch.get() != epoch || !ui.is_unlocked() || ui.live.borrow().is_some() {
+                return;
+            }
+            let (account, token) = match token {
+                Ok(found) => found,
+                // The sync says so in its banner; trying again won't help.
+                Err(session::Error::Api(crate::api::ApiError::SessionExpired)) => return,
+                Err(error) => return ui.live_ended(Some(error.to_string())),
+            };
+            let (server, device) = (account.server.clone(), account.device_id.clone());
+            ui.account.replace(Some(account));
+            let id = ui.live_count.get() + 1;
+            ui.live_count.set(id);
+            let stop: crate::live::Stop = Default::default();
+            ui.live.replace(Some((id, stop.clone())));
+            let started = std::thread::Builder::new()
+                .name("vord-live".into())
+                .spawn(move || {
+                    let ended = crate::live::listen(&server, &token, &device, &stop, |event| {
+                        glib::idle_add_once(move || live_news(id, LiveNews::Event(event)));
+                    });
+                    glib::idle_add_once(move || live_news(id, LiveNews::Ended(ended.err())));
+                });
+            if let Err(error) = started {
+                ui.live.replace(None);
+                log::warn!("could not start live sync: {error}");
+            }
+        });
+    }
+
+    fn stop_live(&self) {
+        if let Some((_, stop)) = self.live.take() {
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        if let Some(retry) = self.live_retry.take() {
+            retry.remove();
+        }
+        self.live_sync_due.set(false);
+    }
+
+    fn on_live(self: &Rc<Self>, id: u64, news: LiveNews) {
+        if self.live.borrow().as_ref().map(|(current, _)| *current) != Some(id) {
+            return;
+        }
+        match news {
+            LiveNews::Event(crate::live::Event::Connected) => {
+                self.live_failures.set(0);
+                log::info!("live sync: listening for changes");
+            }
+            LiveNews::Event(crate::live::Event::Changed) => {
+                // A burst of changes (an import, a move) syncs once.
+                if !self.live_sync_due.replace(true) {
+                    let ui = Rc::downgrade(self);
+                    glib::timeout_add_local_once(Duration::from_millis(800), move || {
+                        if let Some(ui) = ui.upgrade() {
+                            if ui.live_sync_due.replace(false) {
+                                log::debug!("live sync: the vault changed elsewhere");
+                                ui.sync();
+                            }
+                        }
+                    });
+                }
+            }
+            LiveNews::Event(crate::live::Event::LoggedOut) => {
+                log::info!("live sync: the server logged this session out");
+                self.sync();
+            }
+            LiveNews::Ended(why) => {
+                self.live.replace(None);
+                self.live_ended(why);
+            }
+        }
+    }
+
+    /// Try the hub again after a wait that grows with each failure.
+    fn live_ended(self: &Rc<Self>, why: Option<String>) {
+        if !self.is_unlocked() {
+            return;
+        }
+        let failures = self.live_failures.get();
+        self.live_failures.set(failures + 1);
+        let wait = LIVE_RETRY[failures.min(LIVE_RETRY.len() - 1)];
+        match why {
+            // The first failure says why; repeats stay quiet.
+            Some(why) if failures == 0 => {
+                log::info!("live sync: {why}; trying again in {wait}s")
+            }
+            Some(why) => log::debug!("live sync: {why}; trying again in {wait}s"),
+            None => log::debug!("live sync: closed; trying again in {wait}s"),
+        }
+        let ui = Rc::downgrade(self);
+        let epoch = self.epoch.get();
+        let retry = glib::timeout_add_local_once(Duration::from_secs(wait), move || {
+            if let Some(ui) = ui.upgrade().filter(|ui| ui.epoch.get() == epoch) {
+                ui.live_retry.take();
+                ui.start_live();
+            }
+        });
+        if let Some(old) = self.live_retry.replace(Some(retry)) {
+            old.remove();
+        }
+    }
+
     // ---- lock when left alone -----------------------------------------
 
     fn watch_focus(self: &Rc<Self>) {
@@ -1667,6 +1827,13 @@ impl Ui {
             .license_type(gtk::License::Gpl30)
             .build();
         about.present(Some(&self.window));
+    }
+}
+
+/// An event from the live-sync thread, delivered on the main loop.
+fn live_news(id: u64, news: LiveNews) {
+    if let Some(ui) = LIVE_UI.with(|w| w.borrow().upgrade()) {
+        ui.on_live(id, news);
     }
 }
 

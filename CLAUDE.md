@@ -50,6 +50,8 @@ src/export.rs    Bitwarden's export formats from the cached sync: JSON, CSV, enc
 src/generator.rs passwords / passphrases / usernames, Bitwarden's rules; EFF list in data/
 src/totp.rs      otpauth://, steam://, bare base32; RFC 6238 vectors in the tests
 src/clipboard.rs secret copies carry x-kde-passwordManagerHint=secret; auto-clear
+src/live.rs      live sync: the notifications hub (SignalR, MessagePack over a
+                 websocket) on a thread of its own; a change by another device syncs
 src/icons.rs     /icons/<host>/icon.png from the user's own server, cached in ~/.cache/vord
 src/screenlock.rs logind Lock + PrepareForSleep; Omarchy's shell lock is invisible to
                  logind, so `omarchy-hyprland-session-locked` is polled while unlocked and
@@ -127,7 +129,8 @@ node tests/seed.js && node tests/two-factor.js enable
 cargo run -- login http://localhost:8222 test@vord.test [--method email] [--remember]
 ```
 
-Writes against the seeded server: `cargo test -- --ignored live_changes` (folders,
+The hub: `cargo test -- --ignored live_hub` (a change is heard by another device's
+listener, not by this device's). Writes against the seeded server: `cargo test -- --ignored live_changes` (folders,
 favorite, trash, restore, purge, refusing a stale copy, moving into the organization
 and between its collections, attachments both ways, Sends; it adds a collection, a
 `vord-upload.txt` on Router admin and two Sends, to open in another client, each run).

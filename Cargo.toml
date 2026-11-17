@@ -32,6 +32,9 @@ argon2 = "0.5"
 rsa = { version = "0.9", features = ["sha1", "sha2"] }
 subtle = "2"
 rand = "0.8"
+# Live sync: the notifications hub is SignalR over a websocket, in MessagePack.
+tungstenite = { version = "0.30", default-features = false, features = ["handshake", "rustls-tls-native-roots"] }
+rmpv = "1"
 ssh-key = { version = "0.6", default-features = false, features = ["ed25519", "rand_core", "std", "alloc"] }
 
 [dev-dependencies]
