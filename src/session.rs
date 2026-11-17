@@ -383,6 +383,89 @@ pub enum Change {
         name: String,
     },
     DeleteFolder(String),
+    /// Create (`id` is `None`) or update a Send; the body comes from
+    /// [`crate::send::request`]. A new file Send's file is read, encrypted
+    /// with the Send's key and uploaded on the worker.
+    SaveSend {
+        id: Option<String>,
+        body: Value,
+        file: Option<(std::path::PathBuf, SymmetricKey)>,
+    },
+    DeleteSend(String),
+    RemoveSendPassword(String),
+}
+
+/// Create a file Send: make room for it, then upload the file. A Send
+/// whose file didn't arrive is deleted again, as Bitwarden's apps do.
+fn create_file_send(
+    client: &Client,
+    token: &str,
+    body: &Value,
+    path: &std::path::Path,
+    key: &SymmetricKey,
+) -> Result<Value, ApiError> {
+    let plain = Zeroizing::new(
+        std::fs::read(path)
+            .map_err(|e| ApiError::Other(format!("Could not read the file: {e}")))?,
+    );
+    let data = key.encrypt_file(&plain);
+    drop(plain);
+    let file_name = body
+        .pointer("/file/fileName")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let mut body = body.clone();
+    body["fileLength"] = serde_json::json!(data.len());
+    let slot = client.call(
+        reqwest::Method::POST,
+        "/api/sends/file/v2",
+        token,
+        Some(&body),
+    )?;
+    let send = slot
+        .get("sendResponse")
+        .cloned()
+        .ok_or_else(|| ApiError::Other("The server didn't make room for the file.".into()))?;
+    let (Some(id), Some(file_id)) = (
+        send.get("id").and_then(Value::as_str),
+        send.pointer("/file/id").and_then(Value::as_str),
+    ) else {
+        return Err(ApiError::Other(
+            "The server didn't make room for the file.".into(),
+        ));
+    };
+    // 0: straight to the server (Vaultwarden); 1: to Azure (bitwarden.com).
+    // The server checks the upload's file name against the encrypted one.
+    let uploaded = match slot.get("fileUploadType").and_then(Value::as_u64) {
+        Some(1) => match slot.get("url").and_then(Value::as_str) {
+            Some(url) => client.put_blob(url, data),
+            None => Err(ApiError::Other(
+                "The server gave no address for the file.".into(),
+            )),
+        },
+        _ => client.upload(
+            &format!("/api/sends/{id}/file/{file_id}"),
+            token,
+            &file_name,
+            data,
+        ),
+    };
+    if let Err(error) = uploaded {
+        let _ = client.call(
+            reqwest::Method::DELETE,
+            &format!("/api/sends/{id}"),
+            token,
+            None,
+        );
+        return Err(error);
+    }
+    client.call(
+        reqwest::Method::GET,
+        &format!("/api/sends/{id}"),
+        token,
+        None,
+    )
 }
 
 fn upload_attachment(
@@ -470,6 +553,7 @@ pub fn download_attachment(
 /// What a change touched, for the view to select.
 pub enum Touched {
     Item(String),
+    Send(String),
     Nothing,
 }
 
@@ -599,6 +683,20 @@ pub fn change(mut account: Account, change: Change) -> Result<(Account, Value, T
                 call(Method::DELETE, &path, None)?;
                 Some(call(Method::GET, &format!("/api/ciphers/{id}"), None)?)
             }
+            Change::SaveSend { id, body, file } => Some(match (id, file) {
+                (Some(id), _) => call(Method::PUT, &format!("/api/sends/{id}"), Some(body))?,
+                (None, Some((path, key))) => create_file_send(client, token, body, path, key)?,
+                (None, None) => call(Method::POST, "/api/sends", Some(body))?,
+            }),
+            Change::DeleteSend(id) => {
+                call(Method::DELETE, &format!("/api/sends/{id}"), None)?;
+                None
+            }
+            Change::RemoveSendPassword(id) => Some(call(
+                Method::PUT,
+                &format!("/api/sends/{id}/remove-password"),
+                None,
+            )?),
         })
     })
     .map_err(|error| match error {
@@ -611,8 +709,15 @@ pub fn change(mut account: Account, change: Change) -> Result<(Account, Value, T
     })?;
 
     let touched = match (&change, &result) {
-        (Change::SaveFolder { .. } | Change::DeleteFolder(_) | Change::Purge(_), _) => {
-            Touched::Nothing
+        (
+            Change::SaveFolder { .. }
+            | Change::DeleteFolder(_)
+            | Change::Purge(_)
+            | Change::DeleteSend(_),
+            _,
+        ) => Touched::Nothing,
+        (Change::SaveSend { .. } | Change::RemoveSendPassword(_), Some(send)) => {
+            Touched::Send(id_of(send)?)
         }
         (_, Some(cipher)) => Touched::Item(id_of(cipher)?),
         (_, None) => Touched::Nothing,
@@ -633,6 +738,11 @@ pub fn change(mut account: Account, change: Change) -> Result<(Account, Value, T
         (Change::SaveFolder { .. }, Some(folder)) => {
             let id = folder["id"].as_str().unwrap_or_default().to_string();
             replace_by_id(&mut sync["folders"], &id, Some(folder));
+        }
+        (Change::DeleteSend(id), _) => replace_by_id(&mut sync["sends"], id, None),
+        (Change::SaveSend { .. } | Change::RemoveSendPassword(_), Some(send)) => {
+            let id = send["id"].as_str().unwrap_or_default().to_string();
+            replace_by_id(&mut sync["sends"], &id, Some(send));
         }
         (_, Some(cipher)) => {
             let id = cipher["id"].as_str().unwrap_or_default().to_string();
@@ -926,6 +1036,127 @@ mod live {
         };
         let (account, _, _) = change(account, add).unwrap();
 
+        // Sends other apps made open (tests/seed.js makes two).
+        use crate::send::{self, SendKind};
+        let vault = open(&account, &user_key, &sync);
+        let door = vault.sends.iter().find(|s| s.name == "Door code").unwrap();
+        assert!(!door.damaged && door.hidden && door.has_password);
+        assert_eq!(door.text.as_deref().map(String::as_str), Some("4711"));
+        assert_eq!(
+            door.notes.as_deref().map(String::as_str),
+            Some("For the plumber")
+        );
+        assert_eq!(door.max_access_count, Some(5));
+        let plan = vault.sends.iter().find(|s| s.name == "Floor plan").unwrap();
+        assert_eq!(plan.kind, SendKind::File);
+        assert_eq!(plan.file_name.as_deref(), Some("floor-plan.txt"));
+
+        // A text Send: made, changed, its password set and taken off.
+        let week = gtk::glib::DateTime::now_utc()
+            .unwrap()
+            .add_days(7)
+            .unwrap()
+            .format("%Y-%m-%dT%H:%M:%S.%fZ")
+            .unwrap()
+            .to_string();
+        let mut draft = send::Draft::new(SendKind::Text);
+        draft.name = "Live test Send".to_string().into();
+        draft.text = "made by Vord".to_string().into();
+        draft.deletes = Some(week.clone());
+        let (body, _) = send::request(&draft, None, &user_key).unwrap();
+        let save = Change::SaveSend {
+            id: None,
+            body,
+            file: None,
+        };
+        let (account, sync, touched) = change(account, save).unwrap();
+        let Touched::Send(made) = touched else {
+            panic!("a new Send is touched");
+        };
+        let vault = open(&account, &user_key, &sync);
+        let original = send::Draft::open(vault.send(&made).unwrap());
+        let mut edited = original.clone();
+        edited.notes = "edited".to_string().into();
+        edited.password = "open sesame".to_string().into();
+        edited.max_access_count = Some(2);
+        let raw = vault.raw_sends.get(&made).unwrap();
+        let (body, _) = send::request(&edited, Some((raw, &original)), &user_key).unwrap();
+        let save = Change::SaveSend {
+            id: Some(made.clone()),
+            body,
+            file: None,
+        };
+        let (account, sync, _) = change(account, save).unwrap();
+        let vault = open(&account, &user_key, &sync);
+        let saved = vault.send(&made).unwrap();
+        assert!(saved.has_password && !saved.damaged);
+        assert_eq!(saved.notes.as_deref().map(String::as_str), Some("edited"));
+        assert_eq!(
+            saved.text.as_deref().map(String::as_str),
+            Some("made by Vord")
+        );
+        assert_eq!(saved.max_access_count, Some(2));
+        // Saving again without a new password keeps it.
+        let original = send::Draft::open(saved);
+        let raw = vault.raw_sends.get(&made).unwrap();
+        let (body, _) = send::request(&original, Some((raw, &original)), &user_key).unwrap();
+        let save = Change::SaveSend {
+            id: Some(made.clone()),
+            body,
+            file: None,
+        };
+        let (account, sync, _) = change(account, save).unwrap();
+        assert!(
+            open(&account, &user_key, &sync)
+                .send(&made)
+                .unwrap()
+                .has_password
+        );
+        let (account, sync, _) = change(account, Change::RemoveSendPassword(made.clone())).unwrap();
+        assert!(
+            !open(&account, &user_key, &sync)
+                .send(&made)
+                .unwrap()
+                .has_password
+        );
+        let (account, sync, _) = change(account, Change::DeleteSend(made.clone())).unwrap();
+        assert!(open(&account, &user_key, &sync).send(&made).is_none());
+
+        // A file Send, and a text one with a password, stay, to open their
+        // links in the web vault.
+        let file = dir.path().join("vord-send.txt");
+        std::fs::write(&file, "sent by Vord\n").unwrap();
+        let mut draft = send::Draft::new(SendKind::File);
+        draft.name = "Vord file Send".to_string().into();
+        draft.file_name = Some("vord-send.txt".into());
+        draft.deletes = Some(week.clone());
+        let (body, key) = send::request(&draft, None, &user_key).unwrap();
+        let save = Change::SaveSend {
+            id: None,
+            body,
+            file: Some((file, key)),
+        };
+        let (account, sync, touched) = change(account, save).unwrap();
+        let Touched::Send(made) = touched else {
+            panic!("a new Send is touched");
+        };
+        let sent = open(&account, &user_key, &sync);
+        let sent = sent.send(&made).unwrap();
+        assert_eq!(sent.file_name.as_deref(), Some("vord-send.txt"));
+        assert!(sent.file_size.is_some());
+        let mut draft = send::Draft::new(SendKind::Text);
+        draft.name = "Vord text Send".to_string().into();
+        draft.text = "sent by Vord, with a password".to_string().into();
+        draft.password = "open sesame".to_string().into();
+        draft.deletes = Some(week);
+        let (body, _) = send::request(&draft, None, &user_key).unwrap();
+        let save = Change::SaveSend {
+            id: None,
+            body,
+            file: None,
+        };
+        let (account, _, _) = change(account, save).unwrap();
+
         // The folder goes; the cache matches a fresh sync.
         let (account, sync, _) = change(account, Change::DeleteFolder(folder.clone())).unwrap();
         assert!(!open(&account, &user_key, &sync)
@@ -945,5 +1176,6 @@ mod live {
         };
         assert_eq!(ids(&sync, "ciphers"), ids(&fresh, "ciphers"));
         assert_eq!(ids(&sync, "folders"), ids(&fresh, "folders"));
+        assert_eq!(ids(&sync, "sends"), ids(&fresh, "sends"));
     }
 }

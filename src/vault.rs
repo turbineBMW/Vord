@@ -390,6 +390,10 @@ pub struct Vault {
     pub raw: HashMap<String, Value>,
     /// The account's id on the server.
     pub user_id: Option<String>,
+    /// Sends, by name.
+    pub sends: Vec<crate::send::Send>,
+    /// Each Send as the server sent it, as `raw` for items.
+    pub raw_sends: HashMap<String, Value>,
 }
 
 fn array(value: Option<&Value>) -> &[Value] {
@@ -496,6 +500,15 @@ impl Vault {
             .iter()
             .filter_map(|cipher| Some((str_at(cipher, "id")?.to_string(), cipher.clone())))
             .collect();
+        let mut sends: Vec<crate::send::Send> = array(sync.get("sends"))
+            .iter()
+            .filter_map(|send| crate::send::open(send, &keys.user))
+            .collect();
+        sends.sort_by_cached_key(|s| s.name.to_lowercase());
+        let raw_sends = array(sync.get("sends"))
+            .iter()
+            .filter_map(|send| Some((str_at(send, "id")?.to_string(), send.clone())))
+            .collect();
         Self {
             organizations,
             folders,
@@ -507,7 +520,13 @@ impl Vault {
                 .pointer("/profile/id")
                 .and_then(Value::as_str)
                 .map(str::to_string),
+            sends,
+            raw_sends,
         }
+    }
+
+    pub fn send(&self, id: &str) -> Option<&crate::send::Send> {
+        self.sends.iter().find(|s| s.id == id)
     }
 
     pub fn item(&self, id: &str) -> Option<&Item> {

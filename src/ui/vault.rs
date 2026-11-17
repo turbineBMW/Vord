@@ -11,7 +11,7 @@
 //! Lists are never changed from inside their own selection signals (a GTK
 //! rule Rustle learned the hard way): rebuilding waits for an idle.
 
-use super::{detail, editor::Editor, Ui};
+use super::{detail, editor::Editor, send::SendEditor, Ui};
 use crate::vault::{Item, Kind, Vault};
 use adw::prelude::*;
 use gtk::{gio, glib};
@@ -26,10 +26,15 @@ pub enum Filter {
     Folder(Option<String>),
     Collection(String),
     Trash,
+    /// Sends, not items.
+    Sends,
 }
 
 impl Filter {
     fn accepts(&self, item: &Item) -> bool {
+        if matches!(self, Filter::Sends) {
+            return false;
+        }
         if matches!(self, Filter::Trash) {
             return item.deleted;
         }
@@ -43,7 +48,7 @@ impl Filter {
             Filter::Folder(None) => item.folder_id.is_none() && item.org_id.is_none(),
             Filter::Folder(Some(id)) => item.folder_id.as_deref() == Some(id),
             Filter::Collection(id) => item.collection_ids.iter().any(|c| c == id),
-            Filter::Trash => unreachable!(),
+            Filter::Trash | Filter::Sends => unreachable!(),
         }
     }
 }
@@ -79,12 +84,18 @@ pub struct VaultView {
     detail_title: adw::WindowTitle,
     /// The details' own buttons, hidden while an item is edited.
     view_buttons: Vec<gtk::Widget>,
+    /// The ones only an item has, hidden for a Send.
+    item_buttons: Vec<gtk::Widget>,
+    more: gtk::MenuButton,
+    item_menu: gio::Menu,
+    send_menu: gio::Menu,
     edit_cancel: gtk::Button,
     edit_save: gtk::Button,
     new_button: gtk::MenuButton,
     folder_menu: gtk::MenuButton,
     /// The open editor. While there is one, the lists can't be used.
     editor: RefCell<Option<Rc<Editor>>>,
+    send_editor: RefCell<Option<Rc<SendEditor>>>,
     vault: RefCell<Option<Rc<Vault>>>,
     filter: RefCell<Filter>,
     selected: RefCell<Option<String>>,
@@ -225,6 +236,15 @@ impl VaultView {
         ] {
             new_menu.append(Some(label), Some(&format!("win.new-item::{kind}")));
         }
+        let sends_section = gio::Menu::new();
+        sends_section.append(Some("_Text Send"), Some("win.new-send::text"));
+        sends_section.append(Some("_File Send"), Some("win.new-send::file"));
+        let new_menu = {
+            let menu = gio::Menu::new();
+            menu.append_section(None, &new_menu);
+            menu.append_section(None, &sends_section);
+            menu
+        };
         let new_button = gtk::MenuButton::builder()
             .icon_name("list-add-symbolic")
             .tooltip_text("New Item (Ctrl+N for a login)")
@@ -322,6 +342,16 @@ impl VaultView {
             section.append_item(&entry);
         }
         item_menu.append_section(None, &section);
+        let send_menu = gio::Menu::new();
+        let section = gio::Menu::new();
+        section.append(Some("_Copy Link"), Some("win.copy-send-link"));
+        let entry = gio::MenuItem::new(Some("_Remove Password"), Some("win.remove-send-password"));
+        entry.set_attribute_value("hidden-when", Some(&"action-disabled".to_variant()));
+        section.append_item(&entry);
+        send_menu.append_section(None, &section);
+        let section = gio::Menu::new();
+        section.append(Some("_Delete Send…"), Some("win.delete-send"));
+        send_menu.append_section(None, &section);
         let more = gtk::MenuButton::builder()
             .icon_name("view-more-symbolic")
             .tooltip_text("More")
@@ -396,16 +426,21 @@ impl VaultView {
             detail_page,
             detail_title,
             view_buttons: vec![
-                quick.upcast(),
-                open_website.upcast(),
+                quick.clone().upcast(),
+                open_website.clone().upcast(),
                 edit.upcast(),
-                more.upcast(),
+                more.clone().upcast(),
             ],
+            item_buttons: vec![quick.upcast(), open_website.upcast()],
+            more,
+            item_menu,
+            send_menu,
             edit_cancel,
             edit_save,
             new_button,
             folder_menu,
             editor: RefCell::new(None),
+            send_editor: RefCell::new(None),
             vault: RefCell::new(None),
             filter: RefCell::new(Filter::All),
             selected: RefCell::new(None),
@@ -669,6 +704,11 @@ impl VaultView {
         }
         entries.push((None, String::new(), String::new()));
         entries.push((
+            Some(Filter::Sends),
+            "mail-send-symbolic".into(),
+            "Sends".into(),
+        ));
+        entries.push((
             Some(Filter::Trash),
             "user-trash-symbolic".into(),
             "Trash".into(),
@@ -728,7 +768,10 @@ impl VaultView {
                             .ellipsize(gtk::pango::EllipsizeMode::End)
                             .build(),
                     );
-                    let n = count(filter);
+                    let n = match filter {
+                        Filter::Sends => vault.sends.len(),
+                        filter => count(filter),
+                    };
                     if n > 0 {
                         line.append(
                             &gtk::Label::builder()
@@ -768,6 +811,7 @@ impl VaultView {
                 .find(|c| &c.id == id)
                 .map_or("Collection".into(), |c| c.name.clone()),
             Filter::Trash => "Trash".into(),
+            Filter::Sends => "Sends".into(),
         }
     }
 
@@ -783,6 +827,16 @@ impl VaultView {
         self.item_list.remove_all();
         let mut rows = Vec::new();
         let mut selected_row = None;
+        if filter == Filter::Sends {
+            for send in &vault.sends {
+                let row = super::send::row(send);
+                self.item_list.append(&row);
+                if selected.as_deref() == Some(send.id.as_str()) {
+                    selected_row = Some(row);
+                }
+                rows.push((send.id.clone(), send.search_text()));
+            }
+        }
         // Favourites first in All Items, then by name (the vault is sorted).
         let mut items: Vec<&Item> = vault.items.iter().filter(|i| filter.accepts(i)).collect();
         if filter == Filter::All {
@@ -827,9 +881,12 @@ impl VaultView {
             })
             .count();
         let any_visible = visible > 0;
-        let total = match rows.len() {
-            1 => "1 item".to_string(),
-            n => format!("{n} items"),
+        let sends = *self.filter.borrow() == Filter::Sends;
+        let total = match (rows.len(), sends) {
+            (1, false) => "1 item".to_string(),
+            (n, false) => format!("{n} items"),
+            (1, true) => "1 Send".to_string(),
+            (n, true) => format!("{n} Sends"),
         };
         self.list_title.set_subtitle(&if searching {
             format!("{visible} of {total}")
@@ -842,6 +899,12 @@ impl VaultView {
                 self.list_empty.set_title("No Results");
                 self.list_empty
                     .set_description(Some("Nothing in this view matches."));
+            } else if sends {
+                self.list_empty.set_icon_name(Some("mail-send-symbolic"));
+                self.list_empty.set_title("No Sends");
+                self.list_empty.set_description(Some(
+                    "A Send shares a text or a file by link, end-to-end encrypted. Make one with +.",
+                ));
             } else if *self.filter.borrow() == Filter::Trash {
                 self.list_empty.set_icon_name(Some("user-trash-symbolic"));
                 self.list_empty.set_title("Trash Is Empty");
@@ -865,10 +928,46 @@ impl VaultView {
         Some((vault, id))
     }
 
+    fn selected_send(&self) -> Option<(Rc<Vault>, String)> {
+        let vault = self.vault.borrow().clone()?;
+        let id = self.selected.borrow().clone()?;
+        vault.send(&id)?;
+        Some((vault, id))
+    }
+
+    /// The selected Send's id, if it's still there.
+    pub fn selected_send_id(&self) -> Option<String> {
+        self.selected_send().map(|(_, id)| id)
+    }
+
+    /// The details' header as an item or a Send needs it.
+    fn header_for_send(&self, send: bool) {
+        for widget in &self.item_buttons {
+            widget.set_visible(!send);
+        }
+        self.more.set_menu_model(Some(if send {
+            &self.send_menu
+        } else {
+            &self.item_menu
+        }));
+    }
+
     pub fn show_detail(&self, ui: &Rc<Ui>) {
-        if self.editor.borrow().is_some() {
+        if self.editing() {
             // A sync while editing leaves the form alone; the save finds
             // out if the item changed meanwhile.
+            self.update_item_actions(ui);
+            return;
+        }
+        let send = self.selected_send();
+        self.header_for_send(*self.filter.borrow() == Filter::Sends);
+        if let Some((vault, id)) = send {
+            let send = vault.send(&id).expect("checked");
+            let widget = super::send::detail(ui, send);
+            self.detail_scroller.set_child(Some(&widget));
+            self.detail_stack.set_visible_child_name("item");
+            self.detail_page.set_title(&send.name);
+            self.detail_title.set_title("Send");
             self.update_item_actions(ui);
             return;
         }
@@ -892,12 +991,23 @@ impl VaultView {
     }
 
     pub fn update_item_actions(&self, ui: &Ui) {
-        let editing = self.editor.borrow().is_some();
+        let editing = self.editing();
         let selected = if editing { None } else { self.selected_item() };
         let item = selected.as_ref().and_then(|(vault, id)| vault.item(id));
         let live = item.filter(|i| !i.deleted);
         let trashed = item.filter(|i| i.deleted);
-        ui.set_action_enabled("edit-item", live.is_some_and(|i| i.edit && !i.damaged));
+        let selected_send = if editing { None } else { self.selected_send() };
+        let send = selected_send
+            .as_ref()
+            .and_then(|(vault, id)| vault.send(id));
+        ui.set_action_enabled(
+            "edit-item",
+            live.is_some_and(|i| i.edit && !i.damaged) || send.is_some_and(|s| !s.damaged),
+        );
+        ui.set_action_enabled("copy-send-link", send.is_some_and(|s| s.seed.is_some()));
+        ui.set_action_enabled("remove-send-password", send.is_some_and(|s| s.has_password));
+        ui.set_action_enabled("delete-send", send.is_some());
+        ui.set_action_enabled("new-send", !editing);
         ui.set_action_enabled("clone-item", live.is_some_and(|i| !i.damaged));
         ui.set_action_enabled("add-attachment", live.is_some_and(|i| i.edit && !i.damaged));
         ui.set_action_enabled("favorite", live.is_some());
@@ -958,19 +1068,39 @@ impl VaultView {
         self.editor.borrow().clone()
     }
 
+    pub fn send_editor(&self) -> Option<Rc<SendEditor>> {
+        self.send_editor.borrow().clone()
+    }
+
+    /// Whether an item or a Send is being edited.
+    pub fn editing(&self) -> bool {
+        self.editor.borrow().is_some() || self.send_editor.borrow().is_some()
+    }
+
     /// Show `editor` in place of the details. The lists wait until it's
     /// saved or cancelled.
     pub fn show_editor(&self, ui: &Rc<Ui>, editor: Rc<Editor>) {
-        self.detail_scroller.set_child(Some(&editor.root));
-        self.detail_stack.set_visible_child_name("item");
-        self.detail_title.set_title(&editor.title);
-        self.detail_page.set_title(&editor.title);
-        self.detail_page.set_can_pop(false);
-        self.set_editing(true);
+        self.show_form(&editor.root, &editor.title);
         self.editor.replace(Some(editor.clone()));
-        self.inner.set_show_content(true);
         self.update_item_actions(ui);
         editor.focus();
+    }
+
+    pub fn show_send_editor(&self, ui: &Rc<Ui>, editor: Rc<SendEditor>) {
+        self.show_form(&editor.root, &editor.title);
+        self.send_editor.replace(Some(editor.clone()));
+        self.update_item_actions(ui);
+        editor.focus();
+    }
+
+    fn show_form(&self, root: &gtk::Widget, title: &str) {
+        self.detail_scroller.set_child(Some(root));
+        self.detail_stack.set_visible_child_name("item");
+        self.detail_title.set_title(title);
+        self.detail_page.set_title(title);
+        self.detail_page.set_can_pop(false);
+        self.set_editing(true);
+        self.inner.set_show_content(true);
     }
 
     fn set_editing(&self, editing: bool) {
@@ -999,7 +1129,9 @@ impl VaultView {
     }
 
     fn close_editor(&self) {
-        if self.editor.take().is_some() {
+        let item = self.editor.take().is_some();
+        let send = self.send_editor.take().is_some();
+        if item || send {
             self.detail_scroller.set_child(None::<&gtk::Widget>);
             self.detail_page.set_can_pop(true);
             self.detail_title.set_title("Details");
@@ -1017,6 +1149,9 @@ impl VaultView {
     /// Select an item (or none) once the vault shows it, switching to All
     /// Items (or the Trash) if the current view doesn't hold it.
     pub fn select(&self, vault: &Vault, id: Option<String>) {
+        if id.as_deref().is_some_and(|id| vault.send(id).is_some()) {
+            self.filter.replace(Filter::Sends);
+        }
         if let Some(id) = &id {
             if let Some(item) = vault.item(id) {
                 if !self.filter.borrow().accepts(item) {
