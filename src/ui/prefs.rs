@@ -57,6 +57,38 @@ pub fn show(ui: &Rc<Ui>) {
         crate::omarchy::set_follow(on);
     });
     appearance.add(&omarchy_row);
+    let transparent_row = adw::SwitchRow::builder()
+        .title("Transparent sidebar")
+        .subtitle("Show the desktop behind the vaults and the item list")
+        .active(current.transparent_sidebar)
+        .build();
+    let opacity_row = adw::ActionRow::builder().title("Sidebar opacity").build();
+    let scale = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 1.0, 0.05);
+    scale.set_value(current.sidebar_opacity as f64);
+    scale.set_draw_value(true);
+    scale.set_value_pos(gtk::PositionType::Left);
+    scale.set_hexpand(true);
+    scale.set_width_request(160);
+    scale.set_valign(gtk::Align::Center);
+    scale.set_format_value_func(|_, value| format!("{}%", (value * 100.0).round()));
+    opacity_row.add_suffix(&scale);
+    opacity_row.set_activatable_widget(Some(&scale));
+    transparent_row
+        .bind_property("active", &opacity_row, "sensitive")
+        .sync_create()
+        .build();
+    transparent_row.connect_active_notify(|row| {
+        let on = row.is_active();
+        settings::update(|s| s.transparent_sidebar = on);
+        crate::sidebar::apply();
+    });
+    scale.connect_value_changed(|scale| {
+        let value = ((scale.value() * 100.0).round() / 100.0) as f32;
+        settings::update(|s| s.sidebar_opacity = value);
+        crate::sidebar::apply();
+    });
+    appearance.add(&transparent_row);
+    appearance.add(&opacity_row);
     let icons_row = adw::SwitchRow::builder()
         .title("Show website icons")
         .subtitle("Fetched through your own server's icon service")
