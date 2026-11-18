@@ -182,12 +182,13 @@ password.
 
 With "Follow Omarchy theme" on (the default), Vord takes its colours from the
 current Omarchy theme and changes with it. A theme can also ship a `vord.css`,
-layered over the derived palette. For example, to make the sidebars
-translucent:
+layered over the derived palette.
 
-```css
-:root { --vord-sidebar-opacity: 0.85; }
-```
+To make the vault sidebar and the item list translucent, turn on **Preferences →
+Appearance → Transparent sidebar** and set **Sidebar opacity**. Only their
+backgrounds fade, never the text. The setting is Vord's own, so it works without
+Omarchy and no theme changes it. (Themes used to set `--vord-sidebar-opacity`;
+the first launch with this setting carries that value over.)
 
 ## Licence
 
