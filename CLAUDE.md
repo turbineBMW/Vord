@@ -57,6 +57,11 @@ src/edit.rs      Draft (an item as an editor holds it), `request` (the body that
                  `into_organization` (re-seal the item key, or re-encrypt it all, to share)
 src/send.rs      Sends: the seed sealed in `key`, HKDF to the Send's key, the link,
                  the password hash, `Draft` and `request` (as edit.rs, for Sends)
+src/secrets.rs   Secrets Manager: orgs with it on (from the sync's profile), their
+                 secrets/projects/trash lists (fetched after each sync, memory only),
+                 one secret's value fetched when shown (it's in the org's event log),
+                 Draft and `request`; org key. session.rs: load_secrets, get_secret,
+                 change_secrets
 src/export.rs    Bitwarden's export formats from the cached sync: JSON, CSV, encrypted
                  JSON (account key) and password-protected JSON; own items only
 src/generator.rs passwords / passphrases / usernames, Bitwarden's rules; EFF list in data/
@@ -81,6 +86,7 @@ src/ui/generator.rs the generator dialog; copied values live in Session.generate
 src/ui/editor.rs the item editor, shown in the details pane while editing
 src/ui/export.rs the Export Vault dialog
 src/ui/send.rs   a Send's row, details and editor (the Sends view of the same panes)
+src/ui/secret.rs a secret's row, details and editor (Filter::Secrets/SecretsTrash)
 src/ui/pages.rs  login, two-step and unlock pages;  src/ui/prefs.rs  preferences
 src/style.css    app CSS; colours only from libadwaita variables
 tests/vectors.js independent crypto vectors (Node) -> tests/vectors/*
@@ -142,6 +148,9 @@ docker run -d --name vord-test-vw --network vord-test -e I_REALLY_WANT_VOLATILE_
 node tests/seed.js && node tests/two-factor.js enable
 cargo run -- login http://localhost:8222 test@vord.test [--method email] [--remember]
 ```
+
+Secrets Manager has no local server (Vaultwarden lacks it): `live_secrets` runs against
+bitwarden.com, writing only in the throwaway org named by `VORD_SM_ORG` (see its doc).
 
 The hub: `cargo test -- --ignored live_hub` (a change is heard by another device's
 listener, not by this device's). Writes against the seeded server: `cargo test -- --ignored live_changes` (folders,

@@ -18,6 +18,7 @@ mod export;
 mod generator;
 mod pages;
 mod prefs;
+mod secret;
 mod send;
 mod vault;
 
@@ -129,6 +130,11 @@ pub struct Ui {
     pin_stash: RefCell<std::collections::HashMap<String, String>>,
     /// The tray icon, while it's shown.
     tray: RefCell<Option<ksni::blocking::Handle<crate::tray::Tray>>>,
+    /// Secrets Manager's lists as last fetched (encrypted, in memory
+    /// only), so an unchanged fetch isn't redrawn.
+    secrets_raw: RefCell<Option<Vec<crate::secrets::RawOrg>>>,
+    /// A fetch of them is on its way.
+    loading_secrets: Cell<bool>,
 }
 
 /// Wrong PINs allowed before the master password is needed.
@@ -197,6 +203,8 @@ pub fn build(app: &adw::Application, show: bool) -> Rc<Ui> {
         agent_quiet_until: Cell::new(None),
         tray: RefCell::new(None),
         pin_stash: RefCell::new(Default::default()),
+        secrets_raw: RefCell::new(None),
+        loading_secrets: Cell::new(false),
     });
     ui.unlock.accounts.set_menu_model(Some(&ui.vault.switcher));
     THE_UI.with(|w| w.replace(Rc::downgrade(&ui)));
@@ -299,6 +307,13 @@ impl Ui {
             "copy-send-link",
             "remove-send-password",
             "delete-send",
+            "new-secret",
+            "delete-secret",
+            "restore-secret",
+            "purge-secret",
+            "new-project",
+            "rename-project",
+            "delete-project",
         ] {
             self.set_action_enabled(action, vault);
         }
@@ -928,6 +943,7 @@ impl Ui {
                 Ok((account, None)) => {
                     ui.account.replace(Some(account));
                     ui.vault.sync_ok();
+                    ui.load_secrets();
                 }
                 Ok((account, Some(unlocked))) => {
                     ui.account.replace(Some(account));
@@ -938,6 +954,7 @@ impl Ui {
                         session.keys = unlocked.keys;
                     }
                     ui.vault.show_vault(&ui, vault, false);
+                    ui.load_secrets();
                 }
                 Err(session::Error::Api(crate::api::ApiError::SessionExpired)) => {
                     ui.vault.set_offline(
@@ -972,6 +989,7 @@ impl Ui {
             }
         }
         self.session.replace(None);
+        self.secrets_raw.replace(None);
         UNLOCKED.with(|u| u.set(false));
         self.reprompt_passed.replace(None);
         crate::clipboard::clear_now(&self.window);
@@ -1186,6 +1204,9 @@ impl Ui {
     }
 
     fn start_edit(self: &Rc<Self>) {
+        if self.vault.current_filter().is_secrets() {
+            return self.start_secret_edit();
+        }
         if let Some(id) = self.vault.selected_send_id() {
             return self.start_send_edit(&id);
         }
@@ -1235,6 +1256,9 @@ impl Ui {
     fn save_edit(self: &Rc<Self>) {
         if self.vault.send_editor().is_some() {
             return self.save_send();
+        }
+        if self.vault.secret_editor().is_some() {
+            return self.save_secret();
         }
         let Some(editor) = self.vault.editor() else {
             return;
@@ -1457,6 +1481,414 @@ impl Ui {
                 ui.run_change(change, "Send deleted", |_, _, _| Some(None));
             },
         );
+    }
+
+    // ---- Secrets Manager ------------------------------------------------
+
+    /// Fetch Secrets Manager's lists for the organizations the vault says
+    /// have it (after each sync). An unchanged answer isn't redrawn.
+    fn load_secrets(self: &Rc<Self>) {
+        let Some(vault) = self.vault.current_vault() else {
+            return;
+        };
+        if vault.sm_orgs.is_empty() || self.loading_secrets.get() {
+            return;
+        }
+        let Some(account) = self.account.borrow().clone() else {
+            return;
+        };
+        let Some(keys) = self.session.borrow().as_ref().map(|s| s.keys.orgs.clone()) else {
+            return;
+        };
+        let orgs = vault.sm_orgs.clone();
+        let epoch = self.epoch.get();
+        self.loading_secrets.set(true);
+        let ui = self.clone();
+        glib::spawn_future_local(async move {
+            let result = gio::spawn_blocking(move || {
+                let (account, raw) = session::load_secrets(account, orgs)?;
+                let secrets = crate::secrets::Secrets::open(&raw, &keys);
+                Ok::<_, session::Error>((account, raw, secrets))
+            })
+            .await
+            .unwrap_or_else(|_| Err(session::Error::Other("Fetching secrets crashed.".into())));
+            ui.loading_secrets.set(false);
+            if ui.epoch.get() != epoch || !ui.is_unlocked() {
+                if let Ok((account, ..)) = result {
+                    ui.account.replace(Some(account));
+                }
+                return;
+            }
+            match result {
+                Ok((account, raw, secrets)) => {
+                    ui.account.replace(Some(account));
+                    let unchanged = ui.secrets_raw.borrow().as_ref() == Some(&raw);
+                    if unchanged && ui.vault.current_secrets().is_some() {
+                        return;
+                    }
+                    ui.secrets_raw.replace(Some(raw));
+                    ui.vault.show_secrets(&ui, Rc::new(secrets));
+                }
+                Err(error) => {
+                    log::warn!("could not fetch secrets: {error}");
+                    // Later failures keep the last lists; the sync's banner
+                    // says when the server can't be reached.
+                    if ui.vault.current_secrets().is_none() {
+                        ui.toast(&format!("Secrets could not be fetched. {error}"));
+                    }
+                }
+            }
+        });
+    }
+
+    /// Fetch one secret's value for the details.
+    pub fn fetch_secret(self: &Rc<Self>, id: &str, org: &str) {
+        let id = id.to_string();
+        let key = self
+            .session
+            .borrow()
+            .as_ref()
+            .and_then(|s| s.keys.orgs.get(org).cloned());
+        let (Some(account), Some(key)) = (self.account.borrow().clone(), key) else {
+            let ui = self.clone();
+            glib::idle_add_local_once(move || {
+                let why = "This organization's key won't open, so its secrets can't be read.";
+                ui.vault.secret_fetched(&ui, &id, Err(why.into()));
+            });
+            return;
+        };
+        let epoch = self.epoch.get();
+        let ui = self.clone();
+        glib::spawn_future_local(async move {
+            let wanted = id.clone();
+            let result = gio::spawn_blocking(move || {
+                let (account, body) = session::get_secret(account, &wanted)?;
+                let opened =
+                    crate::secrets::Opened::open(&body, &key).map_err(session::Error::Other)?;
+                Ok::<_, session::Error>((account, opened))
+            })
+            .await
+            .unwrap_or_else(|_| Err(session::Error::Other("Opening the secret crashed.".into())));
+            if ui.epoch.get() != epoch || !ui.is_unlocked() {
+                return;
+            }
+            let result = match result {
+                Ok((account, opened)) => {
+                    ui.account.replace(Some(account));
+                    Ok(opened)
+                }
+                Err(error) => {
+                    log::warn!("could not open secret {id}: {error}");
+                    Err(error.to_string())
+                }
+            };
+            ui.vault.secret_fetched(&ui, &id, result);
+        });
+    }
+
+    /// The Secrets Manager organization a new secret or project goes in:
+    /// the one the list shows, or the first.
+    fn secrets_org(&self) -> Option<String> {
+        let filter = self.vault.current_filter();
+        filter.secrets_org().map(str::to_string).or_else(|| {
+            let vault = self.vault.current_vault()?;
+            vault.sm_orgs.first().map(|o| o.id.clone())
+        })
+    }
+
+    fn start_new_secret(self: &Rc<Self>) {
+        if !self.is_unlocked() || self.vault.editing() {
+            return;
+        }
+        let Some(secrets) = self.vault.current_secrets() else {
+            return self.toast("The secrets are still on their way.");
+        };
+        let Some(org) = self.secrets_org() else {
+            return;
+        };
+        let draft = crate::secrets::Draft {
+            project: self
+                .vault
+                .current_project()
+                .filter(|p| p.write)
+                .map(|p| p.id),
+            ..Default::default()
+        };
+        let editor = secret::SecretEditor::new(&secrets, &org, &draft, None);
+        self.vault.show_secret_editor(self, editor);
+    }
+
+    fn start_secret_edit(self: &Rc<Self>) {
+        if self.vault.editing() {
+            return;
+        }
+        let (Some(opened), Some(secrets)) = (
+            self.vault.opened_selected_secret(),
+            self.vault.current_secrets(),
+        ) else {
+            return;
+        };
+        if !opened.write {
+            return self.toast("You can read this secret but not change it.");
+        }
+        let editor = secret::SecretEditor::new(
+            &secrets,
+            &opened.org_id,
+            &opened.draft(),
+            Some(opened.id.clone()),
+        );
+        self.vault.show_secret_editor(self, editor);
+    }
+
+    fn save_secret(self: &Rc<Self>) {
+        let Some(editor) = self.vault.secret_editor() else {
+            return;
+        };
+        let draft = editor.draft();
+        if let Some(problem) = draft.problem() {
+            return self.toast(problem);
+        }
+        let key = self
+            .session
+            .borrow()
+            .as_ref()
+            .and_then(|s| s.keys.orgs.get(&editor.org_id).cloned());
+        let Some(key) = key else {
+            return self.toast("This organization's key won't open.");
+        };
+        let body = crate::secrets::request(&draft, &key, editor.value_changed(&draft));
+        let change = session::SecretChange::Save {
+            org: editor.org_id.clone(),
+            id: editor.id.clone(),
+            body,
+        };
+        let message = if editor.id.is_some() {
+            "Secret saved"
+        } else {
+            "Secret created"
+        };
+        self.vault.set_saving(true);
+        self.run_secret_change(change, message, |ui, secrets, touched| {
+            ui.vault.select_secret(secrets, touched);
+        });
+    }
+
+    fn delete_secret(self: &Rc<Self>) {
+        let Some((secrets, row)) = self.vault.selected_secret() else {
+            return;
+        };
+        let body = if secrets.org(&row.org_id).is_some_and(|o| o.admin) {
+            "It moves to Deleted Secrets, where it can be restored. Machine accounts can't read it meanwhile."
+        } else {
+            "It moves to the organization's trash; an admin can restore it."
+        };
+        self.confirm("Delete Secret?", body, "_Delete", move |ui| {
+            let change = session::SecretChange::Delete(row.id.clone());
+            ui.run_secret_change(change, "Secret deleted", |ui, secrets, _| {
+                ui.vault.select_secret(secrets, None);
+            });
+        });
+    }
+
+    fn restore_secret(self: &Rc<Self>) {
+        let Some((_, row)) = self.vault.selected_secret().filter(|(_, r)| r.deleted) else {
+            return;
+        };
+        let change = session::SecretChange::Restore {
+            org: row.org_id.clone(),
+            id: row.id.clone(),
+        };
+        self.run_secret_change(change, "Secret restored", |ui, secrets, _| {
+            ui.vault.select_secret(secrets, None);
+        });
+    }
+
+    fn purge_secret(self: &Rc<Self>) {
+        let Some((_, row)) = self.vault.selected_secret().filter(|(_, r)| r.deleted) else {
+            return;
+        };
+        self.confirm(
+            "Delete Permanently?",
+            "The secret is gone for good. This can't be undone.",
+            "_Delete",
+            move |ui| {
+                let change = session::SecretChange::Purge {
+                    org: row.org_id.clone(),
+                    id: row.id.clone(),
+                };
+                ui.run_secret_change(change, "Secret deleted permanently", |ui, secrets, _| {
+                    ui.vault.select_secret(secrets, None);
+                });
+            },
+        );
+    }
+
+    /// Ask for a project's name: a new project in `org` (or the one the
+    /// list shows), or a new name for `project`.
+    fn project_name_dialog(
+        self: &Rc<Self>,
+        org: Option<&str>,
+        project: Option<crate::secrets::Project>,
+    ) {
+        if !self.is_unlocked() || self.vault.editing() {
+            return;
+        }
+        let org = match (&project, org) {
+            (Some(project), _) => Some(project.org_id.clone()),
+            (None, Some(org)) => Some(org.to_string()),
+            (None, None) => self.secrets_org(),
+        };
+        let Some(org) = org else {
+            return;
+        };
+        let entry = gtk::Entry::builder()
+            .activates_default(true)
+            .placeholder_text("Name")
+            .text(project.as_ref().map_or("", |p| p.name.as_str()))
+            .build();
+        let (heading, yes) = match project {
+            Some(_) => ("Rename Project", "_Rename"),
+            None => ("New Project", "_Create"),
+        };
+        let dialog = adw::AlertDialog::new(Some(heading), None);
+        dialog.set_extra_child(Some(&entry));
+        dialog.add_responses(&[("cancel", "_Cancel"), ("yes", yes)]);
+        dialog.set_response_appearance("yes", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("yes"));
+        dialog.set_close_response("cancel");
+        let ui = Rc::downgrade(self);
+        let epoch = self.epoch.get();
+        let typed = entry.clone();
+        dialog.connect_response(Some("yes"), move |_, _| {
+            let Some(ui) = ui.upgrade().filter(|ui| ui.epoch.get() == epoch) else {
+                return;
+            };
+            let name = typed.text().trim().to_string();
+            if name.is_empty() {
+                return;
+            }
+            let key = ui
+                .session
+                .borrow()
+                .as_ref()
+                .and_then(|s| s.keys.orgs.get(&org).cloned());
+            let Some(key) = key else {
+                return ui.toast("This organization's key won't open.");
+            };
+            let id = project.as_ref().map(|p| p.id.clone());
+            let message = if id.is_some() {
+                "Project renamed"
+            } else {
+                "Project created"
+            };
+            let change = session::SecretChange::SaveProject {
+                org: org.clone(),
+                id,
+                body: crate::secrets::project_request(&name, &key),
+            };
+            let org = org.clone();
+            ui.run_secret_change(change, message, move |ui, _, touched| {
+                ui.vault.show_project(&org, touched);
+            });
+        });
+        self.present_dialog(&dialog);
+        entry.grab_focus();
+    }
+
+    fn rename_project(self: &Rc<Self>) {
+        if let Some(project) = self.vault.current_project() {
+            self.project_name_dialog(None, Some(project));
+        }
+    }
+
+    fn delete_project(self: &Rc<Self>) {
+        let Some(project) = self.vault.current_project() else {
+            return;
+        };
+        self.confirm(
+            "Delete Project?",
+            "Deleting a project is permanent and can't be undone. Machine accounts and people lose the access it gave them.",
+            "_Delete",
+            move |ui| {
+                let change = session::SecretChange::DeleteProject(project.id.clone());
+                let org = project.org_id.clone();
+                ui.run_secret_change(change, "Project deleted", move |ui, _, _| {
+                    ui.vault.show_project(&org, None);
+                });
+            },
+        );
+    }
+
+    /// Send a change to Secrets Manager on a worker, then fetch the lists
+    /// again and show them, saying `done`. `after` runs first, with the
+    /// new lists and what the change made, to pick what to show.
+    fn run_secret_change(
+        self: &Rc<Self>,
+        change: session::SecretChange,
+        done: &'static str,
+        after: impl Fn(&Rc<Ui>, &crate::secrets::Secrets, Option<String>) + 'static,
+    ) {
+        let Some(account) = self.account.borrow().clone() else {
+            return;
+        };
+        let Some(keys) = self.session.borrow().as_ref().map(|s| s.keys.orgs.clone()) else {
+            return;
+        };
+        let Some(orgs) = self.vault.current_vault().map(|v| v.sm_orgs.clone()) else {
+            return;
+        };
+        let epoch = self.epoch.get();
+        let ui = self.clone();
+        glib::spawn_future_local(async move {
+            let result = gio::spawn_blocking(move || {
+                let (account, touched) = session::change_secrets(account, change)?;
+                // The change is made; failing to fetch the lists after it
+                // only leaves the old ones up.
+                let (account, lists) = match session::load_secrets(account.clone(), orgs) {
+                    Ok((account, raw)) => {
+                        let secrets = crate::secrets::Secrets::open(&raw, &keys);
+                        (account, Some((raw, secrets)))
+                    }
+                    Err(error) => {
+                        log::warn!("could not fetch secrets after a change: {error}");
+                        (account, None)
+                    }
+                };
+                Ok::<_, session::Error>((account, touched, lists))
+            })
+            .await
+            .unwrap_or_else(|_| Err(session::Error::Other("Saving crashed.".into())));
+            ui.vault.set_saving(false);
+            if ui.epoch.get() != epoch || !ui.is_unlocked() {
+                if let Ok((account, ..)) = result {
+                    ui.account.replace(Some(account));
+                }
+                return;
+            }
+            match result {
+                Ok((account, touched, lists)) => {
+                    ui.account.replace(Some(account));
+                    if ui.vault.secret_editor().is_some() {
+                        ui.vault.end_edit(&ui);
+                    }
+                    if let Some((raw, secrets)) = lists {
+                        after(&ui, &secrets, touched);
+                        ui.secrets_raw.replace(Some(raw));
+                        ui.vault.show_secrets(&ui, Rc::new(secrets));
+                    }
+                    ui.toast(done);
+                }
+                Err(session::Error::Api(crate::api::ApiError::SessionExpired)) => {
+                    ui.toast(
+                        "The server ended this session. Log out and in again to make changes.",
+                    );
+                }
+                Err(error) => {
+                    log::warn!("a Secrets Manager change failed: {error}");
+                    ui.toast(&error.to_string());
+                }
+            }
+        });
     }
 
     fn toggle_favorite(self: &Rc<Self>) {
@@ -2065,6 +2497,24 @@ impl Ui {
         action("new-folder", &[], |ui| ui.folder_name_dialog(None));
         action("rename-folder", &[], |ui| ui.rename_folder());
         action("delete-folder", &[], |ui| ui.delete_folder());
+        action("new-secret", &[], |ui| ui.start_new_secret());
+        action("delete-secret", &[], |ui| ui.delete_secret());
+        action("restore-secret", &[], |ui| ui.restore_secret());
+        action("purge-secret", &[], |ui| ui.purge_secret());
+        action("rename-project", &[], |ui| ui.rename_project());
+        action("delete-project", &[], |ui| ui.delete_project());
+        {
+            // The organization's id; empty for the one the list shows.
+            let new_project = gio::SimpleAction::new("new-project", Some(glib::VariantTy::STRING));
+            let weak = Rc::downgrade(self);
+            new_project.connect_activate(move |_, org| {
+                let (Some(ui), Some(org)) = (weak.upgrade(), org.and_then(|o| o.str())) else {
+                    return;
+                };
+                ui.project_name_dialog(Some(org).filter(|o| !o.is_empty()), None);
+            });
+            self.window.add_action(&new_project);
+        }
         action("copy-send-link", &[], |ui| ui.copy_send_link());
         action("remove-send-password", &[], |ui| ui.remove_send_password());
         action("delete-send", &[], |ui| ui.delete_send());
@@ -2169,6 +2619,7 @@ fn empty_vault() -> Vault {
         user_id: None,
         sends: Vec::new(),
         raw_sends: Default::default(),
+        sm_orgs: Vec::new(),
     }
 }
 

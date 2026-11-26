@@ -2,7 +2,9 @@
 //!
 //! ```text
 //! overlay split (.vault-split)
-//! ├── sidebar: Vault — All Items, Favorites, types, folders, collections, Trash
+//! ├── sidebar: Vault — All Items, Favorites, types, folders, collections,
+//! │   Secrets Manager (per organization: its secrets, projects, trash),
+//! │   Sends, Trash
 //! └── navigation split (.item-split)
 //!     ├── sidebar: Items — search, the list
 //!     └── content: Details
@@ -11,7 +13,8 @@
 //! Lists are never changed from inside their own selection signals (a GTK
 //! rule Rustle learned the hard way): rebuilding waits for an idle.
 
-use super::{detail, editor::Editor, send::SendEditor, Ui};
+use super::{detail, editor::Editor, secret::SecretEditor, send::SendEditor, Ui};
+use crate::secrets::{Opened, SecretRow, Secrets};
 use crate::vault::{Item, Kind, Vault};
 use adw::prelude::*;
 use gtk::{gio, glib};
@@ -28,11 +31,18 @@ pub enum Filter {
     Trash,
     /// Sends, not items.
     Sends,
+    /// An organization's secrets (Secrets Manager): all, or one project's.
+    Secrets {
+        org: String,
+        project: Option<String>,
+    },
+    /// An organization's deleted secrets.
+    SecretsTrash(String),
 }
 
 impl Filter {
     fn accepts(&self, item: &Item) -> bool {
-        if matches!(self, Filter::Sends) {
+        if matches!(self, Filter::Sends) || self.is_secrets() {
             return false;
         }
         if matches!(self, Filter::Trash) {
@@ -48,9 +58,45 @@ impl Filter {
             Filter::Folder(None) => item.folder_id.is_none() && item.org_id.is_none(),
             Filter::Folder(Some(id)) => item.folder_id.as_deref() == Some(id),
             Filter::Collection(id) => item.collection_ids.iter().any(|c| c == id),
-            Filter::Trash | Filter::Sends => unreachable!(),
+            Filter::Trash | Filter::Sends | Filter::Secrets { .. } | Filter::SecretsTrash(_) => {
+                unreachable!()
+            }
         }
     }
+
+    pub fn is_secrets(&self) -> bool {
+        matches!(self, Filter::Secrets { .. } | Filter::SecretsTrash(_))
+    }
+
+    /// The Secrets Manager organization it shows, if it shows one.
+    pub fn secrets_org(&self) -> Option<&str> {
+        match self {
+            Filter::Secrets { org, .. } | Filter::SecretsTrash(org) => Some(org),
+            _ => None,
+        }
+    }
+
+    fn accepts_secret(&self, secret: &SecretRow) -> bool {
+        match self {
+            Filter::Secrets { org, project } => {
+                !secret.deleted
+                    && secret.org_id == *org
+                    && project
+                        .as_ref()
+                        .is_none_or(|p| secret.project.as_ref() == Some(p))
+            }
+            Filter::SecretsTrash(org) => secret.deleted && secret.org_id == *org,
+            _ => false,
+        }
+    }
+}
+
+/// What the details show, for the header's buttons and menu.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Shown {
+    Item,
+    Send,
+    Secret,
 }
 
 /// What the quick-copy actions (and their header buttons) take from the
@@ -94,13 +140,23 @@ pub struct VaultView {
     more: gtk::MenuButton,
     item_menu: gio::Menu,
     send_menu: gio::Menu,
+    secret_menu: gio::Menu,
     edit_cancel: gtk::Button,
     edit_save: gtk::Button,
     new_button: gtk::MenuButton,
     folder_menu: gtk::MenuButton,
+    project_menu: gtk::MenuButton,
     /// The open editor. While there is one, the lists can't be used.
     editor: RefCell<Option<Rc<Editor>>>,
     send_editor: RefCell<Option<Rc<SendEditor>>>,
+    secret_editor: RefCell<Option<Rc<SecretEditor>>>,
+    /// Secrets Manager's lists, once fetched.
+    secrets: RefCell<Option<Rc<Secrets>>>,
+    /// The secret whose value the details show (or are fetching, or
+    /// could not fetch, and why).
+    opened_secret: RefCell<Option<Rc<Opened>>>,
+    fetching_secret: RefCell<Option<String>>,
+    secret_failed: RefCell<Option<(String, String)>>,
     vault: RefCell<Option<Rc<Vault>>>,
     filter: RefCell<Filter>,
     selected: RefCell<Option<String>>,
@@ -252,10 +308,22 @@ impl VaultView {
         let sends_section = gio::Menu::new();
         sends_section.append(Some("_Text Send"), Some("win.new-send::text"));
         sends_section.append(Some("_File Send"), Some("win.new-send::file"));
+        let secrets_section = gio::Menu::new();
+        for (label, action, target) in [
+            ("S_ecret", "win.new-secret", None),
+            // An empty target: the organization the list shows.
+            ("_Project…", "win.new-project", Some("".to_variant())),
+        ] {
+            let entry = gio::MenuItem::new(Some(label), None);
+            entry.set_action_and_target_value(Some(action), target.as_ref());
+            entry.set_attribute_value("hidden-when", Some(&"action-disabled".to_variant()));
+            secrets_section.append_item(&entry);
+        }
         let new_menu = {
             let menu = gio::Menu::new();
             menu.append_section(None, &new_menu);
             menu.append_section(None, &sends_section);
+            menu.append_section(None, &secrets_section);
             menu
         };
         let new_button = gtk::MenuButton::builder()
@@ -274,6 +342,16 @@ impl VaultView {
             .visible(false)
             .build();
         list_header.pack_end(&folder_menu);
+        let project_actions = gio::Menu::new();
+        project_actions.append(Some("_Rename Project…"), Some("win.rename-project"));
+        project_actions.append(Some("_Delete Project…"), Some("win.delete-project"));
+        let project_menu = gtk::MenuButton::builder()
+            .icon_name("view-more-symbolic")
+            .tooltip_text("Project")
+            .menu_model(&project_actions)
+            .visible(false)
+            .build();
+        list_header.pack_end(&project_menu);
         let search = gtk::SearchEntry::builder()
             .placeholder_text("Search vault")
             .css_classes(["list-search"])
@@ -365,6 +443,18 @@ impl VaultView {
         let section = gio::Menu::new();
         section.append(Some("_Delete Send…"), Some("win.delete-send"));
         send_menu.append_section(None, &section);
+        let secret_menu = gio::Menu::new();
+        let section = gio::Menu::new();
+        for (label, action) in [
+            ("_Delete Secret…", "win.delete-secret"),
+            ("_Restore", "win.restore-secret"),
+            ("Delete _Permanently…", "win.purge-secret"),
+        ] {
+            let entry = gio::MenuItem::new(Some(label), Some(action));
+            entry.set_attribute_value("hidden-when", Some(&"action-disabled".to_variant()));
+            section.append_item(&entry);
+        }
+        secret_menu.append_section(None, &section);
         let more = gtk::MenuButton::builder()
             .icon_name("view-more-symbolic")
             .tooltip_text("More")
@@ -450,12 +540,19 @@ impl VaultView {
             more,
             item_menu,
             send_menu,
+            secret_menu,
             edit_cancel,
             edit_save,
             new_button,
             folder_menu,
+            project_menu,
             editor: RefCell::new(None),
             send_editor: RefCell::new(None),
+            secret_editor: RefCell::new(None),
+            secrets: RefCell::new(None),
+            opened_secret: RefCell::new(None),
+            fetching_secret: RefCell::new(None),
+            secret_failed: RefCell::new(None),
             vault: RefCell::new(None),
             filter: RefCell::new(Filter::All),
             selected: RefCell::new(None),
@@ -619,6 +716,21 @@ impl VaultView {
     pub fn show_vault(&self, ui: &Rc<Ui>, vault: Rc<Vault>, loading: bool) {
         self.banner.set_revealed(false);
         super::agent::refresh_keys(ui, &vault);
+        // An account used only for Secrets Manager opens on its secrets.
+        // (First shown, or first synced after a login.)
+        let first = self
+            .vault
+            .borrow()
+            .as_ref()
+            .is_none_or(|v| v.items.is_empty() && v.sm_orgs.is_empty());
+        if first && *self.filter.borrow() == Filter::All && vault.items.is_empty() {
+            if let Some(org) = vault.sm_orgs.first() {
+                self.filter.replace(Filter::Secrets {
+                    org: org.id.clone(),
+                    project: None,
+                });
+            }
+        }
         self.vault.replace(Some(vault));
         self.rebuild_sidebar(ui);
         self.rebuild_items(ui);
@@ -657,9 +769,83 @@ impl VaultView {
         self.search.set_text("");
         self.banner.set_revealed(false);
         self.vault.replace(None);
+        self.secrets.replace(None);
+        self.forget_opened_secret();
         self.selected.replace(None);
         self.filter.replace(Filter::All);
         self.inner.set_show_content(false);
+    }
+
+    /// Show Secrets Manager's lists as now fetched, keeping the filter and
+    /// the selected secret when they still exist.
+    pub fn show_secrets(&self, ui: &Rc<Ui>, secrets: Rc<Secrets>) {
+        self.secrets.replace(Some(secrets));
+        self.rebuild_sidebar(ui);
+        self.rebuild_items(ui);
+    }
+
+    pub fn current_secrets(&self) -> Option<Rc<Secrets>> {
+        self.secrets.borrow().clone()
+    }
+
+    /// Drop the opened secret's decrypted value, and any fetch of one.
+    fn forget_opened_secret(&self) {
+        self.opened_secret.replace(None);
+        self.fetching_secret.replace(None);
+        self.secret_failed.replace(None);
+    }
+
+    /// A fetched secret arrived (or failed): show it if it's still the
+    /// one selected.
+    pub fn secret_fetched(&self, ui: &Rc<Ui>, id: &str, result: Result<Opened, String>) {
+        if self.fetching_secret.borrow().as_deref() != Some(id) {
+            return;
+        }
+        self.fetching_secret.replace(None);
+        match result {
+            Ok(opened) => {
+                self.opened_secret.replace(Some(Rc::new(opened)));
+                self.secret_failed.replace(None);
+            }
+            Err(why) => {
+                self.opened_secret.replace(None);
+                self.secret_failed.replace(Some((id.to_string(), why)));
+            }
+        }
+        if self.selected.borrow().as_deref() == Some(id) {
+            self.show_detail(ui);
+        }
+    }
+
+    /// The selected secret, if one is.
+    pub fn selected_secret(&self) -> Option<(Rc<Secrets>, SecretRow)> {
+        if !self.filter.borrow().is_secrets() {
+            return None;
+        }
+        let secrets = self.secrets.borrow().clone()?;
+        let id = self.selected.borrow().clone()?;
+        let row = secrets.secret(&id)?.clone();
+        Some((secrets, row))
+    }
+
+    /// The selected secret, opened, if its value is here.
+    pub fn opened_selected_secret(&self) -> Option<Rc<Opened>> {
+        let (_, row) = self.selected_secret()?;
+        self.opened_secret
+            .borrow()
+            .clone()
+            .filter(|o| o.id == row.id && !row.deleted)
+    }
+
+    /// The project the list shows, if it shows one.
+    pub fn current_project(&self) -> Option<crate::secrets::Project> {
+        let Filter::Secrets {
+            project: Some(id), ..
+        } = &*self.filter.borrow()
+        else {
+            return None;
+        };
+        self.secrets.borrow().as_ref()?.project(id).cloned()
     }
 
     fn rebuild_sidebar(&self, ui: &Rc<Ui>) {
@@ -687,6 +873,13 @@ impl VaultView {
             }
             entries.push((Some(filter), kind.icon().into(), kind.plural().into()));
         }
+        // A heading's + button: its label, action and the action's target.
+        let mut heading_buttons: Vec<(String, &str, glib::Variant, &str)> = vec![(
+            "FOLDERS".into(),
+            "win.new-folder",
+            ().to_variant(),
+            "New Folder",
+        )];
         entries.push((None, String::new(), "FOLDERS".into()));
         for folder in &vault.folders {
             entries.push((
@@ -715,6 +908,48 @@ impl VaultView {
                     Some(Filter::Collection(collection.id.clone())),
                     "system-users-symbolic".into(),
                     collection.name.clone(),
+                ));
+            }
+        }
+        let secrets = self.secrets.borrow().clone();
+        for org in &vault.sm_orgs {
+            let heading = if vault.sm_orgs.len() == 1 {
+                "SECRETS MANAGER".to_string()
+            } else {
+                format!("SECRETS · {}", org.name.to_uppercase())
+            };
+            heading_buttons.push((
+                heading.clone(),
+                "win.new-project",
+                org.id.to_variant(),
+                "New Project",
+            ));
+            entries.push((None, String::new(), heading));
+            entries.push((
+                Some(Filter::Secrets {
+                    org: org.id.clone(),
+                    project: None,
+                }),
+                super::secret::ICON.into(),
+                "All Secrets".into(),
+            ));
+            for project in secrets.iter().flat_map(|s| &s.projects) {
+                if project.org_id == org.id {
+                    entries.push((
+                        Some(Filter::Secrets {
+                            org: org.id.clone(),
+                            project: Some(project.id.clone()),
+                        }),
+                        super::secret::PROJECT_ICON.into(),
+                        project.name.clone(),
+                    ));
+                }
+            }
+            if org.admin {
+                entries.push((
+                    Some(Filter::SecretsTrash(org.id.clone())),
+                    "user-trash-symbolic".into(),
+                    "Deleted Secrets".into(),
                 ));
             }
         }
@@ -759,16 +994,20 @@ impl VaultView {
                                 .css_classes(["vault-heading"])
                                 .build(),
                         );
-                        if label == "FOLDERS" {
-                            heading.append(
-                                &gtk::Button::builder()
-                                    .icon_name("list-add-symbolic")
-                                    .tooltip_text("New Folder")
-                                    .action_name("win.new-folder")
-                                    .css_classes(["flat", "heading-button"])
-                                    .valign(gtk::Align::Center)
-                                    .build(),
-                            );
+                        if let Some((_, action, target, tip)) =
+                            heading_buttons.iter().find(|(l, ..)| *l == label)
+                        {
+                            let button = gtk::Button::builder()
+                                .icon_name("list-add-symbolic")
+                                .tooltip_text(*tip)
+                                .action_name(*action)
+                                .css_classes(["flat", "heading-button"])
+                                .valign(gtk::Align::Center)
+                                .build();
+                            if target.type_() != glib::VariantTy::UNIT {
+                                button.set_action_target_value(Some(target));
+                            }
+                            heading.append(&button);
                         }
                         row.set_child(Some(&heading));
                     }
@@ -786,6 +1025,12 @@ impl VaultView {
                     );
                     let n = match filter {
                         Filter::Sends => vault.sends.len(),
+                        filter if filter.is_secrets() => secrets.as_ref().map_or(0, |s| {
+                            s.secrets
+                                .iter()
+                                .filter(|r| filter.accepts_secret(r))
+                                .count()
+                        }),
                         filter => count(filter),
                     };
                     if n > 0 {
@@ -828,6 +1073,16 @@ impl VaultView {
                 .map_or("Collection".into(), |c| c.name.clone()),
             Filter::Trash => "Trash".into(),
             Filter::Sends => "Sends".into(),
+            Filter::Secrets { project: None, .. } => "All Secrets".into(),
+            Filter::Secrets {
+                project: Some(id), ..
+            } => self
+                .secrets
+                .borrow()
+                .as_ref()
+                .and_then(|s| s.project(id))
+                .map_or("Project".into(), |p| p.name.clone()),
+            Filter::SecretsTrash(_) => "Deleted Secrets".into(),
         }
     }
 
@@ -843,6 +1098,20 @@ impl VaultView {
         self.item_list.remove_all();
         let mut rows = Vec::new();
         let mut selected_row = None;
+        let secrets = self.secrets.borrow().clone();
+        if let Some(secrets) = secrets.as_ref().filter(|_| filter.is_secrets()) {
+            for secret in secrets.secrets.iter().filter(|s| filter.accepts_secret(s)) {
+                let row = super::secret::row(secrets, secret);
+                self.item_list.append(&row);
+                if selected.as_deref() == Some(secret.id.as_str()) {
+                    selected_row = Some(row);
+                }
+                rows.push((
+                    secret.id.clone(),
+                    secret.search_text(secrets.project_name(secret)),
+                ));
+            }
+        }
         if filter == Filter::Sends {
             for send in &vault.sends {
                 let row = super::send::row(send);
@@ -876,11 +1145,21 @@ impl VaultView {
         self.list_title.set_title(&self.filter_title(&vault));
         self.folder_menu
             .set_visible(matches!(filter, Filter::Folder(Some(_))));
+        self.project_menu.set_visible(matches!(
+            filter,
+            Filter::Secrets {
+                project: Some(_),
+                ..
+            }
+        ));
         if selected_row.is_none() {
             self.selected.replace(None);
         }
         self.item_list.invalidate_filter();
         self.update_empty();
+        if filter.is_secrets() && secrets.is_none() {
+            self.list_stack.set_visible_child_name("loading");
+        }
         self.show_detail(ui);
     }
 
@@ -897,12 +1176,16 @@ impl VaultView {
             })
             .count();
         let any_visible = visible > 0;
-        let sends = *self.filter.borrow() == Filter::Sends;
-        let total = match (rows.len(), sends) {
-            (1, false) => "1 item".to_string(),
-            (n, false) => format!("{n} items"),
-            (1, true) => "1 Send".to_string(),
-            (n, true) => format!("{n} Sends"),
+        let filter = self.filter.borrow().clone();
+        let sends = filter == Filter::Sends;
+        let noun = match &filter {
+            Filter::Sends => ("Send", "Sends"),
+            f if f.is_secrets() => ("secret", "secrets"),
+            _ => ("item", "items"),
+        };
+        let total = match rows.len() {
+            1 => format!("1 {}", noun.0),
+            n => format!("{n} {}", noun.1),
         };
         self.list_title.set_subtitle(&if searching {
             format!("{visible} of {total}")
@@ -921,7 +1204,12 @@ impl VaultView {
                 self.list_empty.set_description(Some(
                     "A Send shares a text or a file by link, end-to-end encrypted. Make one with +.",
                 ));
-            } else if *self.filter.borrow() == Filter::Trash {
+            } else if matches!(filter, Filter::Secrets { .. }) {
+                self.list_empty.set_icon_name(Some(super::secret::ICON));
+                self.list_empty.set_title("No Secrets");
+                self.list_empty
+                    .set_description(Some("Make one with +, under Secret."));
+            } else if matches!(filter, Filter::Trash | Filter::SecretsTrash(_)) {
                 self.list_empty.set_icon_name(Some("user-trash-symbolic"));
                 self.list_empty.set_title("Trash Is Empty");
                 self.list_empty.set_description(None);
@@ -956,16 +1244,65 @@ impl VaultView {
         self.selected_send().map(|(_, id)| id)
     }
 
-    /// The details' header as an item or a Send needs it.
-    fn header_for_send(&self, send: bool) {
+    /// The details' header as an item, a Send or a secret needs it.
+    fn header_for(&self, shown: Shown) {
         for widget in &self.item_buttons {
-            widget.set_visible(!send);
+            widget.set_visible(shown == Shown::Item);
         }
-        self.more.set_menu_model(Some(if send {
-            &self.send_menu
-        } else {
-            &self.item_menu
+        self.more.set_menu_model(Some(match shown {
+            Shown::Item => &self.item_menu,
+            Shown::Send => &self.send_menu,
+            Shown::Secret => &self.secret_menu,
         }));
+    }
+
+    /// The selected secret's details: its value once fetched.
+    fn show_secret_detail(&self, ui: &Rc<Ui>) {
+        self.header_for(Shown::Secret);
+        let Some((secrets, row)) = self.selected_secret() else {
+            self.forget_opened_secret();
+            self.detail_scroller.set_child(None::<&gtk::Widget>);
+            self.detail_stack.set_visible_child_name("empty");
+            self.detail_page.set_title("Details");
+            self.inner.set_show_content(false);
+            self.update_item_actions(ui);
+            return;
+        };
+        // A value fetched before the secret changed is fetched again.
+        let opened = self
+            .opened_secret
+            .borrow()
+            .clone()
+            .filter(|o| o.id == row.id && o.revised == row.revised);
+        let failed = self
+            .secret_failed
+            .borrow()
+            .as_ref()
+            .filter(|(id, _)| *id == row.id)
+            .map(|(_, why)| why.clone());
+        let widget = if let Some(opened) = opened {
+            super::secret::detail(ui, &secrets, &opened)
+        } else if row.deleted {
+            self.forget_opened_secret();
+            super::secret::placeholder(
+                &row,
+                Some("It's in the trash. Restore it to see its value."),
+            )
+        } else if let Some(why) = failed {
+            super::secret::placeholder(&row, Some(&why))
+        } else {
+            if self.fetching_secret.borrow().as_deref() != Some(row.id.as_str()) {
+                self.opened_secret.replace(None);
+                self.fetching_secret.replace(Some(row.id.clone()));
+                ui.fetch_secret(&row.id, &row.org_id);
+            }
+            super::secret::placeholder(&row, None)
+        };
+        self.detail_scroller.set_child(Some(&widget));
+        self.detail_stack.set_visible_child_name("item");
+        self.detail_page.set_title(&row.name);
+        self.detail_title.set_title("Secret");
+        self.update_item_actions(ui);
     }
 
     pub fn show_detail(&self, ui: &Rc<Ui>) {
@@ -975,8 +1312,16 @@ impl VaultView {
             self.update_item_actions(ui);
             return;
         }
+        if self.filter.borrow().is_secrets() {
+            return self.show_secret_detail(ui);
+        }
+        self.forget_opened_secret();
         let send = self.selected_send();
-        self.header_for_send(*self.filter.borrow() == Filter::Sends);
+        self.header_for(if *self.filter.borrow() == Filter::Sends {
+            Shown::Send
+        } else {
+            Shown::Item
+        });
         if let Some((vault, id)) = send {
             let send = vault.send(&id).expect("checked");
             let widget = super::send::detail(ui, send);
@@ -1016,10 +1361,38 @@ impl VaultView {
         let send = selected_send
             .as_ref()
             .and_then(|(vault, id)| vault.send(id));
+        let secret = if editing {
+            None
+        } else {
+            self.selected_secret().map(|(_, row)| row)
+        };
+        let opened_secret = if editing {
+            None
+        } else {
+            self.opened_selected_secret()
+        };
+        let secrets_on = self
+            .vault
+            .borrow()
+            .as_ref()
+            .is_some_and(|v| !v.sm_orgs.is_empty());
         ui.set_action_enabled(
             "edit-item",
-            live.is_some_and(|i| i.edit && !i.damaged) || send.is_some_and(|s| !s.damaged),
+            live.is_some_and(|i| i.edit && !i.damaged)
+                || send.is_some_and(|s| !s.damaged)
+                || opened_secret.as_ref().is_some_and(|o| o.write),
         );
+        ui.set_action_enabled("new-secret", secrets_on && !editing);
+        ui.set_action_enabled("new-project", secrets_on && !editing);
+        let project = self.current_project().filter(|p| p.write && !editing);
+        ui.set_action_enabled("rename-project", project.is_some());
+        ui.set_action_enabled("delete-project", project.is_some());
+        ui.set_action_enabled(
+            "delete-secret",
+            secret.as_ref().is_some_and(|s| !s.deleted && s.write),
+        );
+        ui.set_action_enabled("restore-secret", secret.as_ref().is_some_and(|s| s.deleted));
+        ui.set_action_enabled("purge-secret", secret.as_ref().is_some_and(|s| s.deleted));
         ui.set_action_enabled("copy-send-link", send.is_some_and(|s| s.seed.is_some()));
         ui.set_action_enabled("remove-send-password", send.is_some_and(|s| s.has_password));
         ui.set_action_enabled("delete-send", send.is_some());
@@ -1051,7 +1424,8 @@ impl VaultView {
         );
         ui.set_action_enabled(
             "copy-password",
-            login.is_some_and(|l| l.password.as_ref().is_some_and(|p| !p.is_empty())),
+            login.is_some_and(|l| l.password.as_ref().is_some_and(|p| !p.is_empty()))
+                || opened_secret.is_some(),
         );
         ui.set_action_enabled(
             "copy-totp",
@@ -1088,9 +1462,15 @@ impl VaultView {
         self.send_editor.borrow().clone()
     }
 
-    /// Whether an item or a Send is being edited.
+    pub fn secret_editor(&self) -> Option<Rc<SecretEditor>> {
+        self.secret_editor.borrow().clone()
+    }
+
+    /// Whether an item, a Send or a secret is being edited.
     pub fn editing(&self) -> bool {
-        self.editor.borrow().is_some() || self.send_editor.borrow().is_some()
+        self.editor.borrow().is_some()
+            || self.send_editor.borrow().is_some()
+            || self.secret_editor.borrow().is_some()
     }
 
     /// Show `editor` in place of the details. The lists wait until it's
@@ -1105,6 +1485,13 @@ impl VaultView {
     pub fn show_send_editor(&self, ui: &Rc<Ui>, editor: Rc<SendEditor>) {
         self.show_form(&editor.root, &editor.title);
         self.send_editor.replace(Some(editor.clone()));
+        self.update_item_actions(ui);
+        editor.focus();
+    }
+
+    pub fn show_secret_editor(&self, ui: &Rc<Ui>, editor: Rc<SecretEditor>) {
+        self.show_form(&editor.root, &editor.title);
+        self.secret_editor.replace(Some(editor.clone()));
         self.update_item_actions(ui);
         editor.focus();
     }
@@ -1132,6 +1519,7 @@ impl VaultView {
             self.search.upcast_ref(),
             self.new_button.upcast_ref(),
             self.folder_menu.upcast_ref(),
+            self.project_menu.upcast_ref(),
             self.sync_button.upcast_ref(),
         ] {
             widget.set_sensitive(!editing);
@@ -1147,7 +1535,8 @@ impl VaultView {
     fn close_editor(&self) {
         let item = self.editor.take().is_some();
         let send = self.send_editor.take().is_some();
-        if item || send {
+        let secret = self.secret_editor.take().is_some();
+        if item || send || secret {
             self.detail_scroller.set_child(None::<&gtk::Widget>);
             self.detail_page.set_can_pop(true);
             self.detail_title.set_title("Details");
@@ -1182,7 +1571,38 @@ impl VaultView {
         self.selected.replace(id);
     }
 
+    /// Select a secret (or none) once the lists show it, switching to its
+    /// organization's secrets (or deleted secrets) if the current view
+    /// doesn't hold it.
+    pub fn select_secret(&self, secrets: &Secrets, id: Option<String>) {
+        if let Some(secret) = id.as_deref().and_then(|id| secrets.secret(id)) {
+            if !self.filter.borrow().accepts_secret(secret) {
+                self.filter.replace(if secret.deleted {
+                    Filter::SecretsTrash(secret.org_id.clone())
+                } else {
+                    Filter::Secrets {
+                        org: secret.org_id.clone(),
+                        project: None,
+                    }
+                });
+            }
+        }
+        self.selected.replace(id);
+    }
+
+    /// Show a project's secrets.
+    pub fn show_project(&self, org: &str, project: Option<String>) {
+        self.filter.replace(Filter::Secrets {
+            org: org.to_string(),
+            project,
+        });
+    }
+
     pub fn copy_field(&self, ui: &Rc<Ui>, what: Quick) {
+        if let (Quick::Password, Some(opened)) = (what, self.opened_selected_secret()) {
+            ui.copy("Value", &opened.value, true);
+            return;
+        }
         let Some((vault, id)) = self.selected_item() else {
             return;
         };

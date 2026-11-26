@@ -96,6 +96,7 @@ button.favorite {
 
 /* Secrets and codes read character by character. */
 row.monospace-value .subtitle,
+.secret-value,
 .totp-code {
   font-family: monospace;
 }

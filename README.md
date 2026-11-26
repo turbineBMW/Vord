@@ -48,6 +48,13 @@ Omarchy theme live.
   expiry, a view limit and a password; hide your email or deactivate one.
   The link is copied when a Send is made; everything in it, file included,
   is encrypted before it leaves, and the key travels only in the link.
+- Bitwarden Secrets Manager: an organization's secrets, by project, in the
+  sidebar under Secrets Manager. Read and copy a secret's value; create,
+  edit and delete secrets; create, rename and delete projects; owners and
+  admins restore deleted secrets or delete them for good. A value is
+  fetched when you open the secret, as the web app does, so the
+  organization's event log shows what was read. Machine accounts, access
+  tokens and who has access are still managed in the web app.
 - Up to five accounts, on one server or several: switch from the main
   menu or the lock screen (switching locks the one you leave), add one
   with Add Account…, and log out of one without touching the others.
@@ -155,6 +162,8 @@ Vord follows the Bitwarden client protocol and does all decryption locally:
 - The decrypted things Vord writes are an attachment you save and a plain
   JSON or CSV export, which asks for your master password first; each goes
   only where you pick, readable only by you.
+- Secrets Manager's secrets are never written to disk, not even encrypted:
+  they're fetched after each sync and dropped when the vault locks.
 - A Send's key is in its link (after the `#`, which browsers don't send to
   the server), so Vord copies links as secrets: they're hidden from
   clipboard history and cleared like a password. A Send's password goes to
