@@ -575,9 +575,9 @@ impl UnlockPage {
                 }
                 ui.unlock.error.set_visible(false);
                 if ui.unlock.pin_mode.get() {
-                    ui.unlock_with_pin(ui.unlock.pin.text().to_string());
+                    ui.unlock_with_pin(ui.unlock.pin.text().to_string(), |_| {});
                 } else {
-                    ui.unlock(ui.unlock.password.text().to_string());
+                    ui.unlock(ui.unlock.password.text().to_string(), |_| {});
                 }
             }
         });

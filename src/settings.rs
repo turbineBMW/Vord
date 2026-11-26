@@ -31,6 +31,14 @@ pub struct Settings {
     pub tray: bool,
     /// With the tray icon, closing the window keeps Vord running.
     pub close_to_tray: bool,
+    /// Closing the window hides it and Vord keeps running, tray icon or not;
+    /// launching Vord again shows it.
+    pub run_in_background: bool,
+    /// Start hidden when the session starts (an XDG autostart entry).
+    pub start_at_login: bool,
+    /// The SSH agent asks through `$SSH_ASKPASS` (the PIN or master password
+    /// to unlock, Allow or Deny for a key) rather than in Vord's window.
+    pub ssh_agent_askpass: bool,
 }
 
 impl Default for Settings {
@@ -48,6 +56,9 @@ impl Default for Settings {
             ssh_agent_ask: 0,
             tray: false,
             close_to_tray: true,
+            run_in_background: false,
+            start_at_login: false,
+            ssh_agent_askpass: false,
         }
     }
 }

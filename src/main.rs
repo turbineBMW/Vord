@@ -1,6 +1,8 @@
 mod accent;
 mod agent;
 mod api;
+mod askpass;
+mod autostart;
 mod clipboard;
 mod crypto;
 mod edit;
@@ -34,12 +36,16 @@ fn main() -> anyhow::Result<()> {
         Some("generate") => cli_generate(&args[2..]),
         Some("export") => cli_export(&args[2..]),
         Some("accounts") => cli_accounts(&args[2..]),
+        Some("--hidden") => {
+            run_app(true);
+            Ok(())
+        }
         Some("--help" | "-h" | "help") => {
-            println!("Vord {}: a Bitwarden / Vaultwarden vault for the desktop.\n\n  vord                     open the app\n  vord login SERVER EMAIL [--method authenticator|email|yubikey] [--remember]\n                           log in (master password, then any code, on stdin)\n  vord list                unlock, sync and list items (master password on stdin)\n  vord generate [password|passphrase|username]\n                           make one with the generator's saved options\n  vord accounts [EMAIL]     list the accounts kept, or switch to one\n  vord export json|csv|encrypted_json|password_json FILE\n                           unlock, sync and export (master password, then any\n                           file password, on stdin)", env!("CARGO_PKG_VERSION"));
+            println!("Vord {}: a Bitwarden / Vaultwarden vault for the desktop.\n\n  vord                     open the app\n  vord --hidden            start without a window (Start at login uses this)\n  vord login SERVER EMAIL [--method authenticator|email|yubikey] [--remember]\n                           log in (master password, then any code, on stdin)\n  vord list                unlock, sync and list items (master password on stdin)\n  vord generate [password|passphrase|username]\n                           make one with the generator's saved options\n  vord accounts [EMAIL]     list the accounts kept, or switch to one\n  vord export json|csv|encrypted_json|password_json FILE\n                           unlock, sync and export (master password, then any\n                           file password, on stdin)", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
         _ => {
-            run_app();
+            run_app(false);
             Ok(())
         }
     }
@@ -50,7 +56,9 @@ pub fn ui_unlocked() -> bool {
     ui::UNLOCKED.with(std::cell::Cell::get)
 }
 
-fn run_app() {
+/// `hidden`: build the window without showing it (for Start at login).
+/// Only the launch activation stays hidden; a later launch shows it.
+fn run_app(hidden: bool) {
     // One instance: a second launch raises the running window.
     let app = adw::Application::builder().application_id(APP_ID).build();
     app.connect_startup(|app| {
@@ -88,12 +96,13 @@ fn run_app() {
         app.set_accels_for_action("window.close", &["<Control>w"]);
     });
     let window: std::rc::Rc<std::cell::RefCell<Option<std::rc::Rc<ui::Ui>>>> = Default::default();
+    let hidden = std::cell::Cell::new(hidden);
     app.connect_activate(move |app| {
         if let Some(existing) = app.active_window() {
             existing.present();
             return;
         }
-        window.replace(Some(ui::build(app)));
+        window.replace(Some(ui::build(app, !hidden.replace(false))));
     });
     app.run_with_args::<&str>(&[]);
 }

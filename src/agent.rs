@@ -47,7 +47,12 @@ pub struct Identity {
 /// What a connection asks the window. The answer goes back on `reply`;
 /// dropping it refuses.
 pub enum Request {
-    List(mpsc::Sender<Vec<Identity>>),
+    /// The keys to offer. `process` is who asked (the unlock prompt names
+    /// it when the keys aren't known yet).
+    List {
+        process: String,
+        reply: mpsc::Sender<Vec<Identity>>,
+    },
     /// The private key (OpenSSH format) for the key whose public half is
     /// `blob`, if the user allows `process` to use it.
     Sign {
@@ -252,7 +257,10 @@ fn answer(message: &[u8], process: &str, ask: &dyn Fn(Request)) -> Option<Vec<u8
     match kind {
         REQUEST_IDENTITIES => {
             let (reply, answer) = mpsc::channel();
-            ask(Request::List(reply));
+            ask(Request::List {
+                process: process.to_string(),
+                reply,
+            });
             let keys = answer.recv_timeout(WAIT).ok()?;
             let mut out = vec![IDENTITIES_ANSWER];
             out.extend((keys.len() as u32).to_be_bytes());
@@ -446,7 +454,7 @@ mod tests {
         let socket = serve_at(dir.path().join("agent").join("s.sock"), stop.clone(), {
             let asked = asked.clone();
             move |request| match request {
-                Request::List(reply) => {
+                Request::List { reply, .. } => {
                     let _ = reply.send(keys.iter().map(|(i, _)| i.clone()).collect());
                 }
                 Request::Sign {
@@ -535,7 +543,7 @@ mod tests {
         let ask = {
             let known = known.clone();
             move |request: Request| match request {
-                Request::List(reply) => {
+                Request::List { reply, .. } => {
                     let _ = reply.send(vec![known.clone()]);
                 }
                 Request::Sign { blob, reply, .. } => {
