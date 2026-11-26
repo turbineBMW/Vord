@@ -1,34 +1,31 @@
 //! See-through sidebars.
 //!
-//! `--vord-sidebar-opacity`, a number from 0 to 1, fades the background of
-//! the vault sidebar and the item list, but never their text. It defaults to 1
-//! here, and an Omarchy theme's `vord.css` (see `omarchy::palette`) can lower
-//! it with a one-line `:root { --vord-sidebar-opacity: 0.8; }`.
+//! **Preferences → Appearance → Transparent sidebar** fades the background of
+//! the vault sidebar and the item list, never their text, to the opacity of
+//! the slider below it. Both are Vord's own settings (`transparent_sidebar`,
+//! `sidebar_opacity`), not the Omarchy theme's: the value is stated in a
+//! provider above the theme's, so a theme's `vord.css` can no longer change
+//! it. Themes used to set `--vord-sidebar-opacity`; [`opacity_in`] still reads
+//! that once, so the first launch keeps the look (see `settings`).
 //!
 //! A faded sidebar over the window's own background would only blend into
 //! that colour, so below 1 the main window gets the `vord-transparent` class,
 //! which clears the window background so the desktop shows through. Everything
 //! else that was painted by that background is painted again here, so only the
-//! sidebars turn translucent. GTK has no API to read a custom property back,
-//! so the opacity that decides the class is worked out from the CSS text by
-//! [`opacity_in`] whenever the theme reloads. (After Rustle and Bubo.)
+//! sidebars turn translucent. (After Rustle and Bubo.)
 use adw::prelude::*;
 use gtk::gio;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
-/// The custom property a theme sets.
+/// The custom property the stylesheet reads.
 pub const OPACITY: &str = "--vord-sidebar-opacity";
 
-/// Below the Omarchy provider (`APPLICATION + 2`), so a theme's value wins
-/// over the default of 1.
-///
 /// The vault sidebar is an overlay split view (`.vault-split`); floating over
 /// the list in a narrow window (`.collapsed`, set in `ui::vault`) it stays
 /// opaque. The item list is the sidebar of a nested navigation split view
 /// (`.item-split`), which libadwaita paints in the secondary sidebar colour;
 /// collapsed to one column it has no panes and its pages stay opaque.
-const CSS: &str = "
-:root { --vord-sidebar-opacity: 1; }
+const RULES: &str = "
 overlay-split-view.vault-split:not(.collapsed) > .sidebar-pane {
     background-color: alpha(var(--sidebar-bg-color), var(--vord-sidebar-opacity));
 }
@@ -53,32 +50,54 @@ window.vord-transparent navigation-split-view.item-split > navigation-view > nav
 }
 ";
 
+/// The whole stylesheet at `opacity`.
+fn css(opacity: f32) -> String {
+    format!(":root {{ {OPACITY}: {opacity:.2}; }}\n{RULES}")
+}
+
 const TRANSPARENT: &str = "vord-transparent";
 
 thread_local! {
-    /// The opacity the cascade currently resolves to.
+    static PROVIDER: RefCell<Option<gtk::CssProvider>> = const { RefCell::new(None) };
+    /// The opacity now in force: 1 while the setting is off.
     static CURRENT: Cell<f32> = const { Cell::new(1.0) };
 }
 
-/// Install once during application startup, before the Omarchy theme.
+/// Install once during application startup. Above the Omarchy provider
+/// (`APPLICATION + 2`), so the setting wins over anything a theme states.
 pub fn install(display: &gtk::gdk::Display) {
     let provider = gtk::CssProvider::new();
-    provider.load_from_string(CSS);
     gtk::style_context_add_provider_for_display(
         display,
         &provider,
-        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 3,
     );
+    PROVIDER.with(|cell| cell.replace(Some(provider)));
+    apply();
 }
 
-/// Record the opacity now in force and bring the main window in line.
-pub fn set_opacity(opacity: f32) {
-    CURRENT.with(|current| current.set(opacity));
+/// The opacity the settings ask for: 1 when the sidebar isn't transparent.
+pub fn opacity(transparent: bool, opacity: f32) -> f32 {
+    if transparent {
+        opacity.clamp(0.0, 1.0)
+    } else {
+        1.0
+    }
+}
+
+/// Bring the stylesheet and the main window in line with the settings.
+pub fn apply() {
+    let settings = crate::settings::get();
+    let current = opacity(settings.transparent_sidebar, settings.sidebar_opacity);
+    CURRENT.with(|cell| cell.set(current));
+    PROVIDER.with(|cell| {
+        if let Some(provider) = cell.borrow().as_ref() {
+            provider.load_from_string(&css(current));
+        }
+    });
     let Some(app) = gio::Application::default().and_downcast::<gtk::Application>() else {
         return;
     };
-    // Only the main window: the picture viewer is an application window too,
-    // and keeps its own black background.
     for window in app.windows() {
         if let Some(window) = window.downcast_ref::<adw::ApplicationWindow>() {
             sync(window);
@@ -197,9 +216,14 @@ mod tests {
 
     /// The default the built-in stylesheet states is the one assumed when a
     /// theme states none.
+    /// The stylesheet states the opacity it was built for, and the setting
+    /// only takes effect while the switch is on.
     #[test]
-    fn the_built_in_default_is_opaque() {
-        assert_eq!(opacity_in(CSS), Some(1.0));
+    fn the_stylesheet_states_the_setting() {
+        assert_eq!(opacity_in(&css(0.8)), Some(0.8));
+        assert_eq!(opacity(true, 0.8), 0.8);
+        assert_eq!(opacity(false, 0.3), 1.0);
+        assert_eq!(opacity(true, 1.5), 1.0);
     }
 
     /// The stylesheet parses, and the split views name their panes the way
@@ -214,7 +238,7 @@ mod tests {
         provider.connect_parsing_error(move |_, _, error| {
             errors_clone.borrow_mut().push(error.to_string());
         });
-        provider.load_from_string(CSS);
+        provider.load_from_string(&css(0.8));
         assert!(
             errors.borrow().is_empty(),
             "CSS errors: {:?}",

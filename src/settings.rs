@@ -31,6 +31,10 @@ pub struct Settings {
     pub tray: bool,
     /// With the tray icon, closing the window keeps Vord running.
     pub close_to_tray: bool,
+    /// Fade the sidebars' backgrounds so the desktop shows through (see `sidebar`).
+    pub transparent_sidebar: bool,
+    /// How opaque those backgrounds are, from 0 (clear) to 1 (solid).
+    pub sidebar_opacity: f32,
     /// Closing the window hides it and Vord keeps running, tray icon or not;
     /// launching Vord again shows it.
     pub run_in_background: bool,
@@ -56,6 +60,8 @@ impl Default for Settings {
             ssh_agent_ask: 0,
             tray: false,
             close_to_tray: true,
+            transparent_sidebar: false,
+            sidebar_opacity: 0.8,
             run_in_background: false,
             start_at_login: false,
             ssh_agent_askpass: false,
@@ -93,10 +99,40 @@ pub fn update(change: impl FnOnce(&mut Settings)) {
 
 impl Settings {
     pub fn load() -> Self {
-        std::fs::read(path())
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default()
+        let raw = std::fs::read(path()).ok();
+        let mut settings: Self = raw
+            .as_deref()
+            .and_then(|bytes| serde_json::from_slice(bytes).ok())
+            .unwrap_or_default();
+        if settings.adopt_theme_opacity(raw.as_deref(), crate::omarchy::legacy_sidebar_opacity) {
+            settings.save();
+        }
+        settings
+    }
+
+    /// The sidebars' opacity used to come from the Omarchy theme's `vord.css`. The first time
+    /// settings without `transparent_sidebar` load, a see-through sidebar the theme asked for
+    /// is carried over, so nothing changes on screen; after that the theme has no say. Returns
+    /// whether the settings need saving.
+    fn adopt_theme_opacity(
+        &mut self,
+        raw: Option<&[u8]>,
+        theme_opacity: impl FnOnce() -> Option<f32>,
+    ) -> bool {
+        let migrated = raw
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
+            .is_some_and(|value| value.get("transparent_sidebar").is_some());
+        if migrated {
+            return false;
+        }
+        // Only a followed theme was ever applied.
+        if self.follow_omarchy_theme {
+            if let Some(opacity) = theme_opacity().filter(|opacity| *opacity < 1.0) {
+                self.transparent_sidebar = true;
+                self.sidebar_opacity = opacity;
+            }
+        }
+        true
     }
 
     pub fn save(&self) {
@@ -114,6 +150,32 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_theme_opacity_is_adopted_once() {
+        let old = br#"{"tray":false}"#;
+        let mut s: Settings = serde_json::from_slice(old).unwrap();
+        assert!(!s.transparent_sidebar);
+        assert_eq!(s.sidebar_opacity, 0.8);
+        assert!(s.adopt_theme_opacity(Some(old), || Some(0.6)));
+        assert!(s.transparent_sidebar && s.sidebar_opacity == 0.6);
+
+        // Saved, the theme no longer matters, even if it changes.
+        let saved = serde_json::to_vec(&s).unwrap();
+        let mut again: Settings = serde_json::from_slice(&saved).unwrap();
+        assert!(!again.adopt_theme_opacity(Some(&saved), || panic!("theme read after migration")));
+        assert!(again.transparent_sidebar && again.sidebar_opacity == 0.6);
+
+        // An opaque or absent theme value, or an unfollowed theme, leaves it off.
+        for (theme, follow) in [(Some(1.0), true), (None, true), (Some(0.5), false)] {
+            let mut s = Settings {
+                follow_omarchy_theme: follow,
+                ..Settings::default()
+            };
+            assert!(s.adopt_theme_opacity(None, || theme));
+            assert!(!s.transparent_sidebar, "{theme:?} {follow}");
+        }
+    }
 
     #[test]
     fn missing_keys_take_defaults() {
