@@ -172,6 +172,10 @@ fn cli_login(args: &[String]) -> anyhow::Result<()> {
                     pending.email_hint.as_deref().unwrap_or("your email")
                 ),
                 api::TwoFactorMethod::YubiKey => "Touch the YubiKey".into(),
+                api::TwoFactorMethod::NewDevice => format!(
+                    "This device is new to the account. Code sent to {}",
+                    pending.email_hint.as_deref().unwrap_or("your email")
+                ),
             };
             let code = read_line(&prompt)?;
             session::second_step(&pending, method, &code, remember)

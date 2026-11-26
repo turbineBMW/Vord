@@ -270,6 +270,7 @@ impl LoginPage {
 pub struct TwoFactorPage {
     pub root: adw::ToolbarView,
     who: gtk::Label,
+    title: gtk::Label,
     hint: gtk::Label,
     method: adw::ComboRow,
     code: adw::EntryRow,
@@ -337,6 +338,7 @@ impl TwoFactorPage {
         Self {
             root: frame(&column),
             who,
+            title,
             hint,
             method,
             code,
@@ -416,7 +418,15 @@ impl TwoFactorPage {
         let Some(method) = self.selected_method() else {
             return;
         };
+        let new_device = method == TwoFactorMethod::NewDevice;
         let hint = match method {
+            TwoFactorMethod::NewDevice => {
+                let address = self.email_hint.borrow();
+                format!(
+                    "This is the first login from this computer. Enter the code Bitwarden sent to {}.",
+                    address.as_deref().unwrap_or("your email")
+                )
+            }
             TwoFactorMethod::Authenticator => {
                 "Enter the 6-digit code from your authenticator app.".to_string()
             }
@@ -426,12 +436,22 @@ impl TwoFactorPage {
             },
             TwoFactorMethod::YubiKey => "Insert your YubiKey, then touch its button.".to_string(),
         };
+        self.title.set_label(if new_device {
+            "Verify This Device"
+        } else {
+            "Two-Step Login"
+        });
         self.hint.set_label(&hint);
+        // A new device's code has no remembered-device token to ask for.
+        self.remember.set_visible(!new_device);
         self.code.set_input_purpose(match method {
             TwoFactorMethod::YubiKey => gtk::InputPurpose::FreeForm,
             _ => gtk::InputPurpose::Digits,
         });
-        self.resend.set_visible(method == TwoFactorMethod::Email);
+        self.resend.set_visible(matches!(
+            method,
+            TwoFactorMethod::Email | TwoFactorMethod::NewDevice
+        ));
         self.code.set_text("");
         self.error.set_visible(false);
     }
