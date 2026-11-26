@@ -7,6 +7,7 @@ PREFIX="${PREFIX:-$HOME/.local}"
 APP_ID=io.github.turbinebmw.Vord
 rm -f "$PREFIX/bin/vord" \
   "$PREFIX/share/applications/$APP_ID.desktop" \
+  "${XDG_CONFIG_HOME:-$HOME/.config}/autostart/$APP_ID.desktop" \
   "$PREFIX/share/icons/hicolor/scalable/apps/$APP_ID.svg" \
   "$PREFIX/share/icons/hicolor/symbolic/apps/$APP_ID-symbolic.svg"
 for size in 16 24 32 48 64 128 256 512; do

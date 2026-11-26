@@ -151,6 +151,7 @@ pub fn show(ui: &Rc<Ui>) {
     if ui.is_unlocked() {
         page.add(&pin_group(ui, &dialog));
     }
+    page.add(&background_group(ui, &current));
     page.add(&tray_group(ui, &current));
     page.add(&agent_group(ui, &current));
 
@@ -192,6 +193,44 @@ pub fn show(ui: &Rc<Ui>) {
         page.add(&group);
     }
     dialog.present(Some(&ui.window));
+}
+
+/// Running without a window (and without a tray icon), and starting at login.
+fn background_group(ui: &Rc<Ui>, current: &settings::Settings) -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::builder()
+        .title("Background")
+        .description("Keeps the SSH agent there when no window is open. Open Vord from the app launcher to show it again.")
+        .build();
+    let run = adw::SwitchRow::builder()
+        .title("Run in background")
+        .subtitle("Closing the window keeps Vord running; quit with Ctrl+Q")
+        .active(current.run_in_background)
+        .build();
+    run.connect_active_notify(|row| {
+        let on = row.is_active();
+        settings::update(|s| s.run_in_background = on);
+    });
+    group.add(&run);
+    let login = adw::SwitchRow::builder()
+        .title("Start at login")
+        .subtitle("Starts without a window, locked")
+        .active(current.start_at_login)
+        .build();
+    let weak = Rc::downgrade(ui);
+    login.connect_active_notify(move |row| {
+        let on = row.is_active();
+        match crate::autostart::set(on) {
+            Ok(()) => settings::update(|s| s.start_at_login = on),
+            Err(error) => {
+                log::warn!("autostart entry: {error}");
+                if let Some(ui) = weak.upgrade() {
+                    ui.toast(&format!("Couldn't change starting at login: {error}"));
+                }
+            }
+        }
+    });
+    group.add(&login);
+    group
 }
 
 /// The tray icon, and whether closing the window leaves Vord in it.
@@ -291,6 +330,33 @@ fn agent_group(ui: &Rc<Ui>, current: &settings::Settings) -> adw::PreferencesGro
         .sync_create()
         .build();
     group.add(&ask);
+    let program = crate::askpass::program();
+    let askpass = adw::SwitchRow::builder()
+        .title("Ask in the password dialog")
+        .subtitle(match &program {
+            Some(program) => glib_escape(&format!(
+                "Unlock and allow keys through {} ($SSH_ASKPASS), without Vord's window",
+                program.file_name().map_or_else(
+                    || program.display().to_string(),
+                    |n| n.to_string_lossy().into_owned()
+                )
+            )),
+            None => "Needs $SSH_ASKPASS, which this session doesn't set".into(),
+        })
+        .active(current.ssh_agent_askpass)
+        .build();
+    askpass.connect_active_notify(|row| {
+        let on = row.is_active();
+        settings::update(|s| s.ssh_agent_askpass = on);
+    });
+    if program.is_some() {
+        on.bind_property("active", &askpass, "sensitive")
+            .sync_create()
+            .build();
+    } else {
+        askpass.set_sensitive(false);
+    }
+    group.add(&askpass);
     group
 }
 

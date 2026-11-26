@@ -55,11 +55,23 @@ Omarchy theme live.
 - A tray icon (Preferences → Tray), for Waybar, Omarchy's shell and any
   other StatusNotifierItem host: click to show or hide Vord, or lock and
   quit from its menu. Closing the window can leave Vord running there.
+- Running in the background without a tray icon (Preferences → Background):
+  closing the window keeps Vord running, and opening it from the app
+  launcher shows it again. "Start at login" starts it without a window
+  (`vord --hidden`, from an XDG autostart entry), locked.
 - An SSH agent for the vault's SSH keys (Ed25519, RSA, ECDSA), off until
   you turn it on in Preferences: point `SSH_AUTH_SOCK` at its socket and
   `ssh` and `git` use them. Vord asks before a key signs (every time, once
   until locking, or never) and says which program asked; a request while
-  locked brings Vord up to be unlocked.
+  locked brings Vord up to be unlocked. Before the first unlock Vord
+  doesn't know the keys (nothing decrypted is kept on disk), so asking for
+  the list waits for that unlock too.
+- With "Ask in the password dialog", the agent unlocks (PIN, or the master
+  password) and asks Allow or Deny through `$SSH_ASKPASS`, the program
+  OpenSSH itself uses: on Omarchy, the shell's fullscreen password dialog,
+  with a reason such as "ssh, from git wants to sign with the SSH key
+  “GitHub”". Vord's window stays hidden. Cancelling refuses, and Vord
+  doesn't ask again for 30 seconds.
 - Unlocking with a PIN, as Bitwarden's apps do: after the master password
   once per start, or across restarts if you choose. Five wrong PINs and
   the master password is needed again.

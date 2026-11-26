@@ -60,17 +60,24 @@ pub enum TwoFactorMethod {
     YubiKey,
     Authenticator,
     Email,
+    /// Not a two-step method: bitwarden.com emails a code the first time a
+    /// device logs in to an account without two-step login. The code is
+    /// tied to the device id, and the server sends it on its own.
+    NewDevice,
 }
 
 impl TwoFactorMethod {
-    /// Most preferred first, the order Bitwarden's apps pick a default in.
+    /// The two-step methods, most preferred first, the order Bitwarden's
+    /// apps pick a default in.
     pub const ALL: [Self; 3] = [Self::YubiKey, Self::Authenticator, Self::Email];
 
-    pub fn id(self) -> u8 {
+    /// The provider id; a new device's code has none.
+    pub fn id(self) -> Option<u8> {
         match self {
-            Self::Authenticator => 0,
-            Self::Email => 1,
-            Self::YubiKey => 3,
+            Self::Authenticator => Some(0),
+            Self::Email => Some(1),
+            Self::YubiKey => Some(3),
+            Self::NewDevice => None,
         }
     }
 
@@ -79,6 +86,7 @@ impl TwoFactorMethod {
             Self::Authenticator => "Authenticator app",
             Self::Email => "Email",
             Self::YubiKey => "YubiKey",
+            Self::NewDevice => "New device code",
         }
     }
 
@@ -88,6 +96,7 @@ impl TwoFactorMethod {
             Self::Authenticator => "authenticator",
             Self::Email => "email",
             Self::YubiKey => "yubikey",
+            Self::NewDevice => "new-device",
         }
     }
 }
@@ -112,6 +121,13 @@ pub struct TwoFactorChallenge {
 impl TwoFactorChallenge {
     /// Read from a refused login, if that's why it was refused.
     fn from_body(body: &Value) -> Option<Self> {
+        if asks_for_new_device_code(body) {
+            return Some(Self {
+                methods: vec![TwoFactorMethod::NewDevice],
+                offered: 1,
+                ..Self::default()
+            });
+        }
         let detailed = body.get("twoFactorProviders2").and_then(Value::as_object);
         let listed = body.get("twoFactorProviders").and_then(Value::as_array);
         if detailed.is_none() && listed.is_none() {
@@ -133,7 +149,7 @@ impl TwoFactorChallenge {
         };
         let methods = TwoFactorMethod::ALL
             .into_iter()
-            .filter(|m| ids.contains(&m.id()))
+            .filter(|m| m.id().is_some_and(|id| ids.contains(&id)))
             .collect();
         let mut unsupported = Vec::new();
         for id in &ids {
@@ -157,6 +173,15 @@ impl TwoFactorChallenge {
             offered: ids.len(),
         })
     }
+}
+
+/// Whether a refused login wants the code bitwarden.com emails to a new
+/// device. Its clients go by these words, so they don't change.
+fn asks_for_new_device_code(body: &Value) -> bool {
+    body.pointer("/errorModel/message")
+        .or_else(|| body.get("error_description"))
+        .and_then(Value::as_str)
+        .is_some_and(|message| message.eq_ignore_ascii_case("new device verification required"))
 }
 
 /// The second step sent with a login.
@@ -354,10 +379,18 @@ impl Client {
         ];
         let (provider, token, remember) = match second {
             Some(SecondFactor::Code {
+                method: TwoFactorMethod::NewDevice,
+                code,
+                ..
+            }) => {
+                form.push(("newDeviceOtp", code.to_string()));
+                (None, None, false)
+            }
+            Some(SecondFactor::Code {
                 method,
                 code,
                 remember,
-            }) => (Some(method.id()), Some(code), remember),
+            }) => (method.id(), Some(code), remember),
             Some(SecondFactor::Remembered(token)) => (Some(REMEMBER), Some(token), false),
             None => (None, None, false),
         };
@@ -405,6 +438,32 @@ impl Client {
                 "email": email.trim(),
                 "masterPasswordHash": password_hash,
                 "deviceIdentifier": device_id,
+            }))
+            .send()
+            .map_err(network)?;
+        let (status, body) = Self::read(response)?;
+        if status.is_success() {
+            Ok(())
+        } else {
+            Err(error_from(status, &body))
+        }
+    }
+
+    /// Ask bitwarden.com to email a new device's code again. The code is
+    /// tied to the device, which the server reads from a header.
+    pub fn send_new_device_code(
+        &self,
+        email: &str,
+        password_hash: &str,
+        device_id: &str,
+    ) -> Result<(), ApiError> {
+        let response = self
+            .http
+            .post(self.url("/api/accounts/resend-new-device-otp"))
+            .header("Device-Identifier", device_id)
+            .json(&serde_json::json!({
+                "email": email.trim(),
+                "masterPasswordHash": password_hash,
             }))
             .send()
             .map_err(network)?;
@@ -671,6 +730,24 @@ mod tests {
 
         let wrong_password = serde_json::json!({ "error": "invalid_grant" });
         assert_eq!(TwoFactorChallenge::from_body(&wrong_password), None);
+
+        // bitwarden.com wants the code it emailed to a new device.
+        let body = camel(serde_json::json!({
+            "error": "device_error",
+            "error_description": "New device verification required",
+            "ErrorModel": { "Message": "new device verification required", "Object": "error" }
+        }));
+        let challenge = TwoFactorChallenge::from_body(&body).unwrap();
+        assert_eq!(challenge.methods, [TwoFactorMethod::NewDevice]);
+        assert_eq!(challenge.offered, 1);
+
+        // A wrong code is just refused.
+        let body = camel(serde_json::json!({
+            "error": "device_error",
+            "error_description": "Invalid New Device OTP",
+            "ErrorModel": { "Message": "invalid new device otp" }
+        }));
+        assert_eq!(TwoFactorChallenge::from_body(&body), None);
     }
 
     #[test]

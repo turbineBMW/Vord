@@ -114,6 +114,16 @@ pub struct Ui {
     agent_allowed: RefCell<std::collections::HashSet<String>>,
     /// Requests to sign that wait for the vault to be unlocked.
     agent_waiting: RefCell<Vec<agent::Waiting>>,
+    /// Requests for the key list that wait for the first unlock (until then
+    /// Vord doesn't know which keys the vault holds).
+    agent_listing: RefCell<Vec<agent::Listing>>,
+    /// The keys have been read from a vault since Vord started (or the
+    /// account was switched): `agent_keys` is the answer, even when empty.
+    agent_keys_known: Cell<bool>,
+    /// An askpass dialog is asking to unlock for the agent.
+    agent_asking: Cell<bool>,
+    /// After that dialog was cancelled, don't ask again before this.
+    agent_quiet_until: Cell<Option<std::time::Instant>>,
     /// Other accounts' PIN seals, kept in memory while another account is
     /// in use, so switching back still opens with the PIN.
     pin_stash: RefCell<std::collections::HashMap<String, String>>,
@@ -124,7 +134,8 @@ pub struct Ui {
 /// Wrong PINs allowed before the master password is needed.
 const PIN_ATTEMPTS: u8 = 5;
 
-pub fn build(app: &adw::Application) -> Rc<Ui> {
+/// `show`: present the window (false for `vord --hidden`).
+pub fn build(app: &adw::Application, show: bool) -> Rc<Ui> {
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("Vord")
@@ -180,6 +191,10 @@ pub fn build(app: &adw::Application) -> Rc<Ui> {
         agent_keys: RefCell::new(Vec::new()),
         agent_allowed: RefCell::new(Default::default()),
         agent_waiting: RefCell::new(Vec::new()),
+        agent_listing: RefCell::new(Vec::new()),
+        agent_keys_known: Cell::new(false),
+        agent_asking: Cell::new(false),
+        agent_quiet_until: Cell::new(None),
         tray: RefCell::new(None),
         pin_stash: RefCell::new(Default::default()),
     });
@@ -193,13 +208,14 @@ pub fn build(app: &adw::Application) -> Rc<Ui> {
     ui.watch_focus();
     agent::start(&ui);
     ui.start_tray();
-    // With the tray icon, closing the window hides it; the vault locks
-    // as it would in the background.
+    // With the tray icon, or running in the background, closing the window
+    // hides it; the vault locks as it would in the background.
     let weak = Rc::downgrade(&ui);
     ui.window.connect_close_request(move |window| {
-        let to_tray = weak.upgrade().is_some_and(|ui| ui.tray.borrow().is_some())
-            && settings::get().close_to_tray;
-        if to_tray {
+        let settings = settings::get();
+        let to_tray =
+            weak.upgrade().is_some_and(|ui| ui.tray.borrow().is_some()) && settings.close_to_tray;
+        if to_tray || settings.run_in_background {
             window.set_visible(false);
             glib::Propagation::Stop
         } else {
@@ -225,7 +241,9 @@ pub fn build(app: &adw::Application) -> Rc<Ui> {
         });
     }
     ui.start();
-    ui.window.present();
+    if show {
+        ui.window.present();
+    }
     ui
 }
 
@@ -600,12 +618,14 @@ impl Ui {
         }
     }
 
-    fn unlock(self: &Rc<Self>, password: String) {
+    /// Unlock with the master password. `done` hears how it went (the
+    /// unlock page shows the same message), for the agent's askpass.
+    fn unlock(self: &Rc<Self>, password: String, done: impl FnOnce(Result<(), String>) + 'static) {
         let Some(account) = self.account.borrow().clone() else {
-            return;
+            return done(Err("No account.".into()));
         };
         if password.is_empty() {
-            return;
+            return done(Err("The master password is empty.".into()));
         }
         self.unlock.set_busy(true);
         let ui = self.clone();
@@ -625,26 +645,35 @@ impl Ui {
                         ui.rearm_pin(keys.user.clone());
                     }
                     ui.opened(keys, vault);
+                    done(Ok(()));
                 }
                 Err(error) => {
                     if !matches!(error, session::Error::WrongPassword) {
                         log::warn!("unlock failed: {error}");
                     }
                     ui.unlock.fail(&error.to_string());
+                    done(Err(error.to_string()));
                 }
             }
         });
     }
 
-    fn unlock_with_pin(self: &Rc<Self>, pin: String) {
+    /// Unlock with the PIN; `done` as for [`Ui::unlock`].
+    fn unlock_with_pin(
+        self: &Rc<Self>,
+        pin: String,
+        done: impl FnOnce(Result<(), String>) + 'static,
+    ) {
         let Some(account) = self.account.borrow().clone() else {
-            return;
+            return done(Err("No account.".into()));
         };
         let Some(sealed) = self.pin_sealed.borrow().clone() else {
-            return;
+            return done(Err(
+                "PIN unlock is off until the master password is used.".into()
+            ));
         };
         if pin.is_empty() {
-            return;
+            return done(Err("The PIN is empty.".into()));
         }
         self.unlock.set_busy(true);
         let ui = self.clone();
@@ -662,15 +691,16 @@ impl Ui {
                     ui.unlock.clear_password();
                     ui.pin_attempts.set(0);
                     ui.opened(keys, vault);
+                    done(Ok(()));
                 }
                 Err(session::Error::WrongPin) => {
                     let tries = ui.pin_attempts.get() + 1;
                     ui.pin_attempts.set(tries);
-                    if tries >= PIN_ATTEMPTS {
+                    let message = if tries >= PIN_ATTEMPTS {
                         ui.drop_pin_seal();
-                        ui.unlock.fail("Too many wrong PINs. Unlock with the master password; the PIN works again after that.");
+                        "Too many wrong PINs. Unlock with the master password; the PIN works again after that.".to_string()
                     } else {
-                        ui.unlock.fail(&format!(
+                        format!(
                             "Wrong PIN. {} more tr{} before the master password is needed.",
                             PIN_ATTEMPTS - tries,
                             if PIN_ATTEMPTS - tries == 1 {
@@ -678,13 +708,16 @@ impl Ui {
                             } else {
                                 "ies"
                             }
-                        ));
-                    }
+                        )
+                    };
+                    ui.unlock.fail(&message);
+                    done(Err(message));
                 }
                 Err(error) => {
                     log::warn!("PIN unlock failed: {error}");
                     ui.drop_pin_seal();
                     ui.unlock.fail(&error.to_string());
+                    done(Err(error.to_string()));
                 }
             }
         });
@@ -828,6 +861,7 @@ impl Ui {
         self.start_live();
         agent::unlocked(self);
         self.update_tray();
+        self.arm_lock_timer();
         let weak = Rc::downgrade(self);
         let timer = glib::timeout_add_local(AUTO_SYNC, move || match weak.upgrade() {
             Some(ui) if ui.is_unlocked() => {
@@ -1952,16 +1986,27 @@ impl Ui {
 
     fn watch_focus(self: &Rc<Self>) {
         let weak = Rc::downgrade(self);
-        self.window.connect_is_active_notify(move |window| {
-            let Some(ui) = weak.upgrade() else { return };
+        self.window.connect_is_active_notify(move |_| {
+            if let Some(ui) = weak.upgrade() {
+                ui.arm_lock_timer();
+            }
+        });
+    }
+
+    /// Start the countdown to locking while the window isn't in front
+    /// (including an unlock while it's hidden, through the agent's askpass);
+    /// stop it while it is.
+    fn arm_lock_timer(self: &Rc<Self>) {
+        let ui = self;
+        {
             if let Some(timer) = ui.lock_timer.take() {
                 timer.remove();
             }
             let minutes = settings::get().lock_after_minutes;
-            if window.is_active() || minutes == 0 || !ui.is_unlocked() {
+            if ui.window.is_active() || minutes == 0 || !ui.is_unlocked() {
                 return;
             }
-            let weak = Rc::downgrade(&ui);
+            let weak = Rc::downgrade(ui);
             let timer = glib::timeout_add_local_once(
                 Duration::from_secs(u64::from(minutes) * 60),
                 move || {
@@ -1973,7 +2018,7 @@ impl Ui {
                 },
             );
             ui.lock_timer.replace(Some(timer));
-        });
+        }
     }
 
     // ---- actions --------------------------------------------------------
