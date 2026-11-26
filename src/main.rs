@@ -12,6 +12,7 @@ mod icons;
 mod live;
 mod omarchy;
 mod screenlock;
+mod secrets;
 mod send;
 mod session;
 mod settings;

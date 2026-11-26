@@ -394,6 +394,9 @@ pub struct Vault {
     pub sends: Vec<crate::send::Send>,
     /// Each Send as the server sent it, as `raw` for items.
     pub raw_sends: HashMap<String, Value>,
+    /// The organizations with Secrets Manager on for this account; their
+    /// secrets come separately (see [`crate::secrets`]).
+    pub sm_orgs: Vec<crate::secrets::SmOrg>,
 }
 
 fn array(value: Option<&Value>) -> &[Value] {
@@ -522,6 +525,7 @@ impl Vault {
                 .map(str::to_string),
             sends,
             raw_sends,
+            sm_orgs: crate::secrets::organizations(sync),
         }
     }
 

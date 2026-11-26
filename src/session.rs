@@ -825,6 +825,166 @@ pub fn change(mut account: Account, change: Change) -> Result<(Account, Value, T
     Ok((account, sync, touched))
 }
 
+// ---- Secrets Manager ---------------------------------------------------
+
+/// Fetch every Secrets Manager organization's lists, still encrypted. An
+/// organization that answers "not found" (access taken away since the
+/// sync) is left out.
+pub fn load_secrets(
+    mut account: Account,
+    orgs: Vec<crate::secrets::SmOrg>,
+) -> Result<(Account, Vec<crate::secrets::RawOrg>), Error> {
+    use reqwest::Method;
+    let raw = authed(&mut account, |client, token| {
+        let get = |path: String| client.call(Method::GET, &path, token, None);
+        let mut raw = Vec::new();
+        for org in &orgs {
+            let id = &org.id;
+            let secrets = match get(format!("/api/organizations/{id}/secrets")) {
+                Ok(secrets) => secrets,
+                Err(ApiError::Other(why)) if why.contains("404") => {
+                    log::warn!("no Secrets Manager access in organization {id}");
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let projects = get(format!("/api/organizations/{id}/projects"))?;
+            let trash = if org.admin {
+                Some(get(format!("/api/secrets/{id}/trash"))?)
+            } else {
+                None
+            };
+            raw.push(crate::secrets::RawOrg {
+                org: org.clone(),
+                secrets,
+                projects,
+                trash,
+            });
+        }
+        Ok(raw)
+    })?;
+    Ok((account, raw))
+}
+
+/// One secret with its value and note, still encrypted. The server logs
+/// the fetch in the organization's event log.
+pub fn get_secret(mut account: Account, id: &str) -> Result<(Account, Value), Error> {
+    let body = authed(&mut account, |client, token| {
+        client.call(
+            reqwest::Method::GET,
+            &format!("/api/secrets/{id}"),
+            token,
+            None,
+        )
+    })?;
+    Ok((account, body))
+}
+
+/// A change to an organization's secrets or projects, already encrypted.
+pub enum SecretChange {
+    /// Create (`id` is `None`, in `org`) or update a secret; the body
+    /// comes from [`crate::secrets::request`].
+    Save {
+        org: String,
+        id: Option<String>,
+        body: Value,
+    },
+    /// Move to the trash.
+    Delete(String),
+    Restore {
+        org: String,
+        id: String,
+    },
+    /// Delete from the trash, for good.
+    Purge {
+        org: String,
+        id: String,
+    },
+    /// Create (`id` is `None`, in `org`) or rename a project.
+    SaveProject {
+        org: String,
+        id: Option<String>,
+        body: Value,
+    },
+    /// Delete a project; its secrets stay, in no project.
+    DeleteProject(String),
+}
+
+/// Send a change. Returns the account (its tokens may be new) and the id
+/// of the secret or project it made or changed, if there is one to select.
+pub fn change_secrets(
+    mut account: Account,
+    change: SecretChange,
+) -> Result<(Account, Option<String>), Error> {
+    use reqwest::Method;
+    let touched = authed(&mut account, |client, token| {
+        let call = |method: Method, path: &str, body: Option<&Value>| {
+            client.call(method, path, token, body)
+        };
+        let bulk = |path: &str, id: &str| -> Result<Option<String>, ApiError> {
+            let answer = call(Method::POST, path, Some(&serde_json::json!([id])))?;
+            match crate::secrets::bulk_errors(&answer) {
+                Some(why) => Err(ApiError::Other(why)),
+                None => Ok(None),
+            }
+        };
+        let id_in = |answer: Value| answer.get("id").and_then(Value::as_str).map(str::to_string);
+        Ok(match &change {
+            SecretChange::Save {
+                org,
+                id: None,
+                body,
+            } => id_in(call(
+                Method::POST,
+                &format!("/api/organizations/{org}/secrets"),
+                Some(body),
+            )?),
+            SecretChange::Save {
+                id: Some(id), body, ..
+            } => id_in(call(
+                Method::PUT,
+                &format!("/api/secrets/{id}"),
+                Some(body),
+            )?),
+            SecretChange::Delete(id) => bulk("/api/secrets/delete", id)?,
+            SecretChange::Restore { org, id } => {
+                call(
+                    Method::POST,
+                    &format!("/api/secrets/{org}/trash/restore"),
+                    Some(&serde_json::json!([id])),
+                )?;
+                Some(id.clone())
+            }
+            SecretChange::Purge { org, id } => {
+                call(
+                    Method::POST,
+                    &format!("/api/secrets/{org}/trash/empty"),
+                    Some(&serde_json::json!([id])),
+                )?;
+                None
+            }
+            SecretChange::SaveProject {
+                org,
+                id: None,
+                body,
+            } => id_in(call(
+                Method::POST,
+                &format!("/api/organizations/{org}/projects"),
+                Some(body),
+            )?),
+            SecretChange::SaveProject {
+                id: Some(id), body, ..
+            } => id_in(call(
+                Method::PUT,
+                &format!("/api/projects/{id}"),
+                Some(body),
+            )?),
+            SecretChange::DeleteProject(id) => bulk("/api/projects/delete", id)?,
+        })
+    })?;
+    Ok((account, touched))
+}
+
 /// Check the master password again, as Bitwarden's apps do before an
 /// export. Works offline.
 pub fn check_master_password(account: &Account, password: &str) -> Result<(), Error> {
@@ -1336,5 +1496,205 @@ mod pin_tests {
             unlock_with_pin(&moved_on, &sealed, "2468"),
             Err(Error::Other(_))
         ));
+    }
+}
+
+/// Secrets Manager against bitwarden.com: there is no local server for it
+/// (Vaultwarden has none). Writes go only to the organization named in
+/// `VORD_SM_ORG`, which should be a throwaway one; everything the test
+/// makes is named `vord-live-test` and removed again.
+///
+/// ```text
+/// read -rs P; printf '%s\n' "$P" | VORD_SM_EMAIL=you@example.com \
+///   VORD_SM_ORG="Vord test" cargo test -- --ignored live_secrets --nocapture
+/// ```
+#[cfg(test)]
+mod live_secrets {
+    use super::*;
+    use crate::secrets::{self, Draft, Opened, SecretRow, Secrets};
+
+    fn lists(account: Account, org: &secrets::SmOrg, keys: &Keys) -> (Account, Secrets) {
+        let (account, raw) = load_secrets(account, vec![org.clone()]).unwrap();
+        (account, Secrets::open(&raw, &keys.orgs))
+    }
+
+    fn row<'a>(secrets: &'a Secrets, id: &str) -> Option<&'a SecretRow> {
+        secrets.secret(id)
+    }
+
+    #[test]
+    #[ignore]
+    fn live_secrets() {
+        let email = std::env::var("VORD_SM_EMAIL").expect("VORD_SM_EMAIL");
+        let org_name = std::env::var("VORD_SM_ORG").expect("VORD_SM_ORG");
+        let account = store::accounts()
+            .into_iter()
+            .find(|a| a.email.eq_ignore_ascii_case(&email))
+            .expect("no saved account with that email; log in with Vord first");
+        let mut password = String::new();
+        std::io::stdin().read_line(&mut password).unwrap();
+        let password = Zeroizing::new(password.trim_end_matches(['\r', '\n']).to_string());
+        let user_key = unlock_key(&account, &password).expect("the master password");
+        let (account, sync) = sync(account).unwrap();
+        let unlocked = open_sync(&account, user_key, &sync);
+        let keys = unlocked.keys;
+        let orgs = &unlocked.vault.sm_orgs;
+        println!(
+            "Secrets Manager organizations: {:?}",
+            orgs.iter().map(|o| &o.name).collect::<Vec<_>>()
+        );
+        let org = orgs
+            .iter()
+            .find(|o| o.name == org_name)
+            .unwrap_or_else(|| panic!("no Secrets Manager organization named {org_name:?}"))
+            .clone();
+        assert!(org.admin, "the test organization should be your own");
+        let key = keys
+            .orgs
+            .get(&org.id)
+            .expect("the organization's key")
+            .clone();
+        let (account, before) = lists(account, &org, &keys);
+        println!(
+            "{org_name}: {} secrets, {} projects to begin with",
+            before.secrets.len(),
+            before.projects.len()
+        );
+
+        // A project, renamed.
+        let (account, project) = change_secrets(
+            account,
+            SecretChange::SaveProject {
+                org: org.id.clone(),
+                id: None,
+                body: secrets::project_request("vord-live-test", &key),
+            },
+        )
+        .unwrap();
+        let project = project.expect("the new project's id");
+        let (account, _) = change_secrets(
+            account,
+            SecretChange::SaveProject {
+                org: org.id.clone(),
+                id: Some(project.clone()),
+                body: secrets::project_request("vord-live-test renamed", &key),
+            },
+        )
+        .unwrap();
+        let (account, now) = lists(account, &org, &keys);
+        assert_eq!(
+            now.project(&project).unwrap().name,
+            "vord-live-test renamed"
+        );
+        println!("project made and renamed");
+
+        // A secret in it.
+        let draft = Draft {
+            name: Zeroizing::new("vord-live-test".into()),
+            value: Zeroizing::new("first value\nsecond line".into()),
+            note: Zeroizing::new("made by Vord's live test".into()),
+            project: Some(project.clone()),
+        };
+        let (account, id) = change_secrets(
+            account,
+            SecretChange::Save {
+                org: org.id.clone(),
+                id: None,
+                body: secrets::request(&draft, &key, false),
+            },
+        )
+        .unwrap();
+        let id = id.expect("the new secret's id");
+        let (account, now) = lists(account, &org, &keys);
+        let listed = row(&now, &id).expect("the new secret is listed");
+        assert_eq!(listed.name, "vord-live-test");
+        assert_eq!(listed.project.as_deref(), Some(project.as_str()));
+        assert!(listed.write);
+        let (account, body) = get_secret(account, &id).unwrap();
+        let opened = Opened::open(&body, &key).unwrap();
+        assert!(opened.draft() == draft);
+        println!("secret made in the project, and read back");
+
+        // Changed, and out of the project.
+        let changed = Draft {
+            name: Zeroizing::new("vord-live-test changed".into()),
+            value: Zeroizing::new("second value".into()),
+            note: Zeroizing::new(String::new()),
+            project: None,
+        };
+        let (account, _) = change_secrets(
+            account,
+            SecretChange::Save {
+                org: org.id.clone(),
+                id: Some(id.clone()),
+                body: secrets::request(&changed, &key, true),
+            },
+        )
+        .unwrap();
+        let (account, body) = get_secret(account, &id).unwrap();
+        assert!(Opened::open(&body, &key).unwrap().draft() == changed);
+        println!("secret changed and taken out of the project");
+
+        // Back in the project, which is then deleted.
+        let back = Draft {
+            project: Some(project.clone()),
+            ..changed.clone()
+        };
+        let (account, _) = change_secrets(
+            account,
+            SecretChange::Save {
+                org: org.id.clone(),
+                id: Some(id.clone()),
+                body: secrets::request(&back, &key, false),
+            },
+        )
+        .unwrap();
+        let (account, _) =
+            change_secrets(account, SecretChange::DeleteProject(project.clone())).unwrap();
+        let (account, now) = lists(account, &org, &keys);
+        assert!(now.project(&project).is_none());
+        match row(&now, &id) {
+            Some(left) => println!(
+                "project deleted; its secret stays, in project {:?}",
+                left.project
+            ),
+            None => println!("project deleted; its secret went with it"),
+        }
+
+        // Deleted, restored, deleted, deleted for good.
+        let account = if row(&now, &id).is_some() {
+            let (account, _) = change_secrets(account, SecretChange::Delete(id.clone())).unwrap();
+            let (account, now) = lists(account, &org, &keys);
+            assert!(row(&now, &id).unwrap().deleted, "in the trash");
+            let restore = SecretChange::Restore {
+                org: org.id.clone(),
+                id: id.clone(),
+            };
+            let (account, _) = change_secrets(account, restore).unwrap();
+            let (account, now) = lists(account, &org, &keys);
+            assert!(!row(&now, &id).unwrap().deleted, "restored");
+            let (account, _) = change_secrets(account, SecretChange::Delete(id.clone())).unwrap();
+            println!("secret deleted, restored, deleted");
+            account
+        } else {
+            account
+        };
+        let (account, now) = lists(account, &org, &keys);
+        let account = match row(&now, &id) {
+            Some(trashed) => {
+                assert!(trashed.deleted);
+                let purge = SecretChange::Purge {
+                    org: org.id.clone(),
+                    id: id.clone(),
+                };
+                change_secrets(account, purge).unwrap().0
+            }
+            None => account,
+        };
+        let (_, after) = lists(account, &org, &keys);
+        assert!(row(&after, &id).is_none(), "gone for good");
+        assert_eq!(after.secrets.len(), before.secrets.len());
+        assert_eq!(after.projects.len(), before.projects.len());
+        println!("secret deleted for good; {org_name} is as it was");
     }
 }
